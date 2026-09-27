@@ -149,6 +149,34 @@ and provide a path relative to your current directory:
 
     $ transcrypt --show-raw sensitive_file
 
+### Checking Pushes for Unencrypted Secrets
+
+transcrypt installs a Git pre-push hook that refuses to push commits the remote
+doesn't have yet if any of them stores, without encryption:
+
+- a file that _.gitattributes_ marks for encryption, whether in that commit, in
+  your working tree, or on the remote, so dropping a rule doesn't get past it
+- a file that was encrypted before that commit
+- an exact copy of a decrypted secret (16 bytes or more), such as a backup or
+  a secret moved to a path that isn't encrypted
+
+It needs no password and doesn't check history the remote already has. It also
+runs in clones where transcrypt isn't configured, which would otherwise commit
+secrets unencrypted without any warning. To protect those, install the hook
+into every new clone on your machine, once:
+
+    $ mkdir -p ~/.git-templates/hooks
+    $ cp .git/hooks/pre-push-crypt ~/.git-templates/hooks/pre-push
+    $ git config --global init.templateDir ~/.git-templates
+
+In a clone without transcrypt configured, the hook uses the `transcrypt` on your
+`PATH`, or refuses to push from a repository that uses transcrypt if it isn't
+installed. In repositories that don't use transcrypt it does nothing. Copy the
+hook into existing clones yourself; the template only applies to new ones.
+
+The hook can't make a push that already reached the remote safe, and
+`git push --no-verify` skips it.
+
 ### Initialize a Clone of a Configured Repository
 
 If you have just cloned a repository containing files that are encrypted, you'll

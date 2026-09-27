@@ -49,6 +49,12 @@ system, you must also run the `--upgrade` command in each repository:
 
 ### Added
 
+- Pre-push hook, installed on init and `--upgrade`: refuses to push commits
+  that store without encryption a file marked for encryption (by the commit's,
+  the working tree's or the remote's attributes), a file that was encrypted
+  before, or an exact copy of a decrypted secret. Needs no password, only checks
+  commits the remote doesn't have, and can be installed into every new clone
+  through `init.templateDir` to protect clones where transcrypt isn't configured
 - `--verify` option: check that every committed encrypted file is stored
   encrypted and decrypts with the configured password
 - `--add` accepts several patterns (`--add a --add b`) and reports what it

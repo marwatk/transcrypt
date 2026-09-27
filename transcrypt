@@ -349,6 +349,13 @@ is_ciphertext() {
 	[[ "$(head -c8 "$1" | LC_ALL=C tr -d '\0')" == "U2FsdGVk" ]]
 }
 
+# Succeed if file $1 holds content as transcrypt stores it encrypted: starting
+# like ciphertext and base64 throughout. Content that merely starts like
+# ciphertext but contains anything else is plaintext
+is_stored_ciphertext() {
+	is_ciphertext "$1" && ! LC_ALL=C grep -aq $'[^A-Za-z0-9+/=\r]' "$1"
+}
+
 git_clean() {
 	context=$(extract_context_name_from_name_value_arg "$1")
 	[[ "$context" ]] && shift
@@ -365,9 +372,6 @@ git_clean() {
 	if [[ ! -s $tempfile ]]; then
 		return
 	fi
-	# the first bytes of an encrypted file are always "Salted" in Base64
-	# The `head + LC_ALL=C tr` command handles binary data in old and new Bash (#116)
-	firstbytes=$(head -c8 "$tempfile" | LC_ALL=C tr -d '\0')
 	# missing settings are reported below rather than failing silently here
 	context_config_group=$(derive_context_config_group "$context")
 	cipher=$(git config --get --local "transcrypt${context_config_group}.cipher") || true
@@ -377,7 +381,7 @@ git_clean() {
 	# encrypted, is stored as it is. Encrypted content is base64 throughout, so
 	# content that merely starts like it but contains anything else is
 	# plaintext and gets encrypted
-	if [[ $firstbytes == "U2FsdGVk" ]] && ! LC_ALL=C grep -aq $'[^A-Za-z0-9+/=\r]' "$tempfile"; then
+	if is_stored_ciphertext "$tempfile"; then
 		cat "$tempfile"
 	else
 		# refuse rather than store the file unencrypted or with an empty password
@@ -607,6 +611,184 @@ git_pre_commit() {
 
 	rm -f "${tmp}"
 	unset IFS
+}
+
+# Read NUL-terminated paths on stdin, and print, NUL-terminated, those that
+# have a crypt filter in any context. Arguments go to `git check-attr`, e.g.
+# `--source=<commit>` to use the attributes as of a commit
+_crypt_attributed_z() {
+	local path attr info
+	git -c core.quotePath=false check-attr -z --stdin "$@" filter 2>/dev/null |
+		while IFS= read -r -d '' path && IFS= read -r -d '' attr && IFS= read -r -d '' info; do
+			if [[ $info == crypt* ]]; then
+				printf '%s\0' "$path"
+			fi
+		done
+}
+
+# Pre-push hook: refuse to push commits that store without encryption a file
+# transcrypt encrypts, or a copy of one. Git passes the remote's name ($1) and
+# URL ($2), and on stdin a line "<local ref> <local oid> <remote ref> <remote
+# oid>" for each ref being pushed. Needs no password: the working tree holds
+# the decrypted secrets, which is all the copy check compares against
+git_pre_push() {
+	local remote=${1:-}
+	cd "$(git rev-parse --show-toplevel)" >/dev/null || exit 1
+
+	# Commits being pushed that the remote doesn't have yet. History already
+	# on the remote isn't checked again
+	local local_oid remote_oid revs=() attr_sources=()
+	while read -r _ local_oid _ remote_oid; do
+		[[ $local_oid =~ ^0+$ ]] && continue # deleting a ref
+		revs+=("$local_oid")
+		if [[ ! $remote_oid =~ ^0+$ ]] && git cat-file -e "${remote_oid}^{commit}" 2>/dev/null; then
+			revs+=("^$remote_oid")
+			attr_sources+=("$remote_oid")
+		fi
+	done
+	[[ ${#revs[@]} -gt 0 ]] || return 0
+	local remote_head
+	if remote_head=$(git rev-parse -q --verify "refs/remotes/${remote}/HEAD^{commit}" 2>/dev/null); then
+		attr_sources+=("$remote_head")
+	fi
+	local commits=() commit
+	while read -r commit; do
+		commits+=("$commit")
+	done < <(git rev-list "${revs[@]}" --not --remotes="$remote" --)
+	[[ ${#commits[@]} -gt 0 ]] || return 0
+
+	# Nothing to protect: not a transcrypt repository, e.g. a hook installed
+	# into every clone through init.templateDir
+	if [[ -z "$(git ls-files -z | _crypt_attributed_z | head -c1)" ]] &&
+		! git grep -q -e 'filter=crypt' "${commits[@]}" ${attr_sources[@]+"${attr_sources[@]}"} \
+			-- ':(glob)**/.gitattributes' 2>/dev/null; then
+		return 0
+	fi
+
+	# Files each commit adds, changes or deletes, compared with its first parent
+	local meta path old_mode new_mode old_oid new_oid
+	local e_commit=() e_path=() e_old_mode=() e_old=() e_new_mode=() e_new=()
+	for commit in "${commits[@]}"; do
+		while IFS= read -r -d '' meta && IFS= read -r -d '' path; do
+			read -r old_mode new_mode old_oid new_oid _ <<<"${meta#:}"
+			e_commit+=("$commit")
+			e_path+=("$path")
+			e_old_mode+=("$old_mode")
+			e_old+=("$old_oid")
+			e_new_mode+=("$new_mode")
+			e_new+=("$new_oid")
+		done < <(git diff-tree -r -z --no-commit-id --no-renames --root --diff-merges=first-parent "$commit")
+	done
+	[[ ${#e_path[@]} -gt 0 ]] || return 0
+
+	# not local: the EXIT trap runs after this function has returned
+	blob=$(mktemp 2>/dev/null || mktemp -t tmp)
+	old_blob=$(mktemp 2>/dev/null || mktemp -t tmp)
+	trap 'rm -f "$blob" "$old_blob"' EXIT
+
+	# Blob ids of decrypted secrets, to spot copies of them: the decrypted
+	# files in the working tree, and, where transcrypt can decrypt them, the
+	# encrypted files the pushed commits delete, e.g. a secret moved to a path
+	# that isn't encrypted. Files under 16 bytes are left out, so tiny values
+	# like "1" don't match unrelated files
+	local file secret_ids=() secret_names=() i id
+	while IFS= read -r -d '' file; do
+		if [[ ! -f $file ]] || [[ -L $file ]] || [[ $(wc -c <"$file") -lt 16 ]]; then
+			continue
+		fi
+		is_ciphertext "$file" && continue # not decrypted in this clone
+		secret_ids+=("$(git hash-object --no-filters -- "$file")")
+		secret_names+=("$file")
+	done < <(_list_encrypted_files_z)
+	local decrypted=()
+	for ((i = 0; i < ${#e_path[@]}; i++)); do
+		[[ ${e_new_mode[$i]} =~ ^0+$ ]] || continue # only deletions
+		[[ ${e_old_mode[$i]} == 100644 || ${e_old_mode[$i]} == 100755 ]] || continue
+		id=${e_old[$i]}
+		if [[ ${#decrypted[@]} -gt 0 ]] && is_item_in_array "$id" "${decrypted[@]}"; then
+			continue
+		fi
+		decrypted+=("$id")
+		git cat-file blob "$id" >"$blob" 2>/dev/null || continue
+		is_stored_ciphertext "$blob" || continue
+		# the smudge filter decrypts it, if this clone has the password
+		git cat-file --filters --path="${e_path[$i]}" "$id" >"$old_blob" 2>/dev/null || continue
+		if [[ $(wc -c <"$old_blob") -ge 16 ]] && ! is_ciphertext "$old_blob"; then
+			secret_ids+=("$(git hash-object --no-filters -- "$old_blob")")
+			secret_names+=("${e_path[$i]}")
+		fi
+	done
+
+	# check-attr --source needs git 2.40; older versions use only the working
+	# tree's attributes plus the encrypted-before rule
+	local has_source=''
+	if git check-attr --source=HEAD filter -- .gitattributes >/dev/null 2>&1; then
+		has_source='true'
+	fi
+
+	local src j reason refusals=() marked=() last_commit=''
+	for ((i = 0; i < ${#e_path[@]}; i++)); do
+		commit=${e_commit[$i]}
+		path=${e_path[$i]}
+		case ${e_new_mode[$i]} in
+		100644 | 100755) ;;
+		*) continue ;; # deleted, symlink or submodule
+		esac
+
+		# Files marked for encryption by the working tree's attributes, and by
+		# those of this commit and of the remote, so a push can't drop a rule
+		if [[ $commit != "$last_commit" ]]; then
+			last_commit=$commit
+			marked=()
+			while IFS= read -r -d '' file; do
+				marked+=("$file")
+			done < <(
+				for ((j = i; j < ${#e_path[@]}; j++)); do
+					[[ ${e_commit[$j]} == "$commit" ]] || break
+					printf '%s\0' "${e_path[$j]}"
+				done >"$old_blob"
+				_crypt_attributed_z <"$old_blob"
+				if [[ $has_source ]]; then
+					_crypt_attributed_z --source="$commit" <"$old_blob"
+					if [[ ${#attr_sources[@]} -gt 0 ]]; then
+						for src in "${attr_sources[@]}"; do
+							_crypt_attributed_z --source="$src" <"$old_blob"
+						done
+					fi
+				fi
+			)
+		fi
+
+		git cat-file blob "${e_new[$i]}" >"$blob"
+		[[ -s $blob ]] || continue # empty files are never encrypted
+		is_stored_ciphertext "$blob" && continue
+		reason=''
+		if [[ ${#marked[@]} -gt 0 ]] && is_item_in_array "$path" "${marked[@]}"; then
+			reason='not encrypted, but .gitattributes marks it for encryption'
+		elif [[ ${e_old_mode[$i]} == 100644 || ${e_old_mode[$i]} == 100755 ]] &&
+			git cat-file blob "${e_old[$i]}" >"$old_blob" && is_stored_ciphertext "$old_blob"; then
+			reason='not encrypted, but it was before this commit'
+		elif [[ ${#secret_ids[@]} -gt 0 ]]; then
+			for ((j = 0; j < ${#secret_ids[@]}; j++)); do
+				if [[ ${e_new[$i]} == "${secret_ids[$j]}" ]]; then
+					reason="same content as the encrypted file ${secret_names[$j]}"
+					break
+				fi
+			done
+		fi
+		if [[ $reason ]]; then
+			refusals+=("$(git rev-parse --short "$commit") $path: $reason")
+		fi
+	done
+
+	if [[ ${#refusals[@]} -gt 0 ]]; then
+		warn 'refusing to push unencrypted secrets to %s:' "$remote"
+		printf '  %s\n' "${refusals[@]}" >&2
+		printf '\nRewrite those commits (e.g. with git rebase -i) so the files are encrypted\n' >&2
+		printf 'or removed, then push again. If a file is not secret after all, push with\n' >&2
+		printf 'git push --no-verify.\n' >&2
+		exit 1
+	fi
 }
 
 # Print the paths of tracked and untracked (not ignored) files that have the
@@ -1013,10 +1195,10 @@ save_helper_hooks() {
 		return 0 # Bypass helper hook installation on rekey
 	fi
 
-	# Install pre-commit-crypt hook script
 	[[ ! -d "${GIT_HOOKS}" ]] && mkdir -p "${GIT_HOOKS}"
-	pre_commit_hook_installed="${GIT_HOOKS}/pre-commit-crypt"
-	cat <<-'EOF' >"$pre_commit_hook_installed"
+
+	# Install pre-commit-crypt hook script
+	cat <<-'EOF' >"${GIT_HOOKS}/pre-commit-crypt"
 		#!/usr/bin/env bash
 		# Transcrypt pre-commit hook: fail if secret file in staging lacks the magic prefix "Salted" in B64
 		RELATIVE_GIT_DIR=$(git rev-parse --git-common-dir 2>/dev/null || printf '')
@@ -1024,24 +1206,45 @@ save_helper_hooks() {
 		"${CRYPT_DIR}/transcrypt" pre_commit
 	EOF
 
-	# Activate hook by copying it to the pre-commit script name, but only if
-	# the global pre-commit hook is not already present
-	pre_commit_hook="${GIT_HOOKS}/pre-commit"
-	if [[ -f "$pre_commit_hook" ]]; then
-		# Nothing to do if our pre-commit hook is already installed
-		hook_md5=$("${openssl_path}" md5 -hex <"$pre_commit_hook")
-		installed_md5=$("${openssl_path}" md5 -hex <"$pre_commit_hook_installed")
-		if [[ "$hook_md5" = "$installed_md5" ]]; then
-			: # no-op
-		else
+	# Install pre-push-crypt hook script. It also works as a hook for every new
+	# clone through git's init.templateDir, before transcrypt is configured
+	cat <<-'EOF' >"${GIT_HOOKS}/pre-push-crypt"
+		#!/usr/bin/env bash
+		# Transcrypt pre-push hook: refuse to push files that transcrypt encrypts, or
+		# copies of them, without encryption
+		RELATIVE_GIT_DIR=$(git rev-parse --git-common-dir 2>/dev/null || printf '')
+		CRYPT_DIR=$(git config transcrypt.crypt-dir 2>/dev/null || printf '%s/crypt' "${RELATIVE_GIT_DIR}")
+		if [[ -x "${CRYPT_DIR}/transcrypt" ]]; then
+			exec "${CRYPT_DIR}/transcrypt" pre_push "$@"
+		elif command -v transcrypt >/dev/null 2>&1; then
+			# a clone where transcrypt isn't configured
+			exec transcrypt pre_push "$@"
+		elif git grep -q -e 'filter=crypt' HEAD -- ':(glob)**/.gitattributes' 2>/dev/null; then
+			echo 'transcrypt: this repository encrypts files with transcrypt, which is not installed; refusing to push' >&2
+			exit 1
+		fi
+	EOF
+	# executable, so they can be copied into place, e.g. into a template
+	chmod 0755 "${GIT_HOOKS}/pre-commit-crypt" "${GIT_HOOKS}/pre-push-crypt"
+	activate_helper_hook pre-commit
+	activate_helper_hook pre-push
+}
+
+# Activate hook script $1-crypt by copying it to hook name $1, unless a
+# different hook with that name is already present
+activate_helper_hook() {
+	local hook="${GIT_HOOKS}/$1" hook_installed="${GIT_HOOKS}/$1-crypt"
+	if [[ -f "$hook" ]]; then
+		# Nothing to do if our hook is already installed
+		if ! cmp -s "$hook" "$hook_installed"; then
 			printf 'WARNING:\n' >&2
-			printf 'Cannot install Git pre-commit hook script because file already exists: %s\n' "$pre_commit_hook" >&2
-			printf 'Please manually install the pre-commit script saved as: %s\n' "$pre_commit_hook_installed" >&2
+			printf 'Cannot install Git %s hook script because file already exists: %s\n' "$1" "$hook" >&2
+			printf 'Please manually install the %s script saved as: %s\n' "$1" "$hook_installed" >&2
 			printf '\n'
 		fi
 	else
-		cp "$pre_commit_hook_installed" "$pre_commit_hook"
-		chmod 0755 "$pre_commit_hook"
+		cp "$hook_installed" "$hook"
+		chmod 0755 "$hook"
 	fi
 }
 
@@ -1322,22 +1525,22 @@ uninstall_transcrypt() {
 			[[ $upgrade ]] || warn 'left %s in place because it contains other files' "$CRYPT_DIR"
 		fi
 
-		# rename helper hooks (don't delete, in case user has custom changes)
-		pre_commit_hook="${GIT_HOOKS}/pre-commit"
-		pre_commit_hook_installed="${GIT_HOOKS}/pre-commit-crypt"
-		if [[ -f "$pre_commit_hook" ]]; then
-			hook_md5=$("${openssl_path}" md5 -hex <"$pre_commit_hook")
-			installed_md5=''
-			if [[ -f "$pre_commit_hook_installed" ]]; then
-				installed_md5=$("${openssl_path}" md5 -hex <"$pre_commit_hook_installed")
+		# remove helper hooks, but only if unchanged, in case of custom changes
+		local hook_name hook hook_installed
+		for hook_name in pre-commit pre-push; do
+			hook="${GIT_HOOKS}/${hook_name}"
+			hook_installed="${GIT_HOOKS}/${hook_name}-crypt"
+			if [[ -f "$hook" ]]; then
+				if [[ -f "$hook_installed" ]] && cmp -s "$hook" "$hook_installed"; then
+					rm "$hook"
+				else
+					printf 'WARNING: Cannot safely disable Git %s hook %s please check it yourself\n' "$hook_name" "$hook"
+				fi
 			fi
-			if [[ "$hook_md5" = "$installed_md5" ]]; then
-				rm "$pre_commit_hook"
-			else
-				printf 'WARNING: Cannot safely disable Git pre-commit hook %s please check it yourself\n' "$pre_commit_hook"
+			if [[ -f "$hook_installed" ]]; then
+				rm "$hook_installed"
 			fi
-		fi
-		[[ -f "$pre_commit_hook_installed" ]] && rm "$pre_commit_hook_installed"
+		done
 
 		# remove the `git add-crypt` alias.
 		git config --unset alias.add-crypt 2>/dev/null || true
@@ -2020,6 +2223,11 @@ while [[ "${1:-}" != '' ]]; do
 	pre_commit)
 		shift
 		git_pre_commit "$@"
+		exit $?
+		;;
+	pre_push)
+		shift
+		git_pre_push "$@"
 		exit $?
 		;;
 	-c | --cipher)
