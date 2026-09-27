@@ -60,7 +60,7 @@ function setup {
   # Use --git-common-dir if available (Git post Nov 2014) otherwise --git-dir
   # shellcheck disable=SC2016
   [ "$(git config --get filter.crypt.clean)" = '"$(git config transcrypt.crypt-dir 2>/dev/null || printf ''%s/crypt'' ""$(git rev-parse --git-common-dir)"")"/transcrypt clean context=default %f' ]
-  [ "$(git config --get filter.crypt.smudge)" = '"$(git config transcrypt.crypt-dir 2>/dev/null || printf ''%s/crypt'' ""$(git rev-parse --git-common-dir)"")"/transcrypt smudge context=default' ]
+  [ "$(git config --get filter.crypt.smudge)" = '"$(git config transcrypt.crypt-dir 2>/dev/null || printf ''%s/crypt'' ""$(git rev-parse --git-common-dir)"")"/transcrypt smudge context=default %f' ]
   [ "$(git config --get diff.crypt.textconv)" = '"$(git config transcrypt.crypt-dir 2>/dev/null || printf ''%s/crypt'' ""$(git rev-parse --git-common-dir)"")"/transcrypt textconv context=default' ]
   [ "$(git config --get merge.crypt.driver)" = '"$(git config transcrypt.crypt-dir 2>/dev/null || printf ''%s/crypt'' ""$(git rev-parse --git-common-dir)"")"/transcrypt merge context=default %O %A %B %L %P' ]
 

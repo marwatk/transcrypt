@@ -77,6 +77,11 @@ The transcrypt source code and full documentation may be downloaded from
     list all contexts configured in the repository, and warn about
     incompletely configured contexts.
 
+  * `--verify`:
+    check that every committed encrypted file is stored encrypted and decrypts
+    with the configured password; use `--context` to check a context other than
+    'default'.
+
   * `-v`, `--version`:
     print the version information
 

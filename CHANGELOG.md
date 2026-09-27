@@ -38,8 +38,33 @@ system, you must also run the `--upgrade` command in each repository:
 
 - Improve test suite to better use `bats` conventions to run tests in
   isoloation, so they can be run faster in parallel (#217, #218)
+- Smudge now receives the file's path (`%f`) so it can verify decryption. Run
+  `transcrypt --upgrade` in existing repositories to apply it.
+- Refuse to initialise with a password that doesn't decrypt the files already
+  committed, instead of saving it and relying on the dirty-files check
+
+### Added
+
+- `--verify` option: check that every committed encrypted file is stored
+  encrypted and decrypts with the configured password
 
 ### Fixed
+
+- Never write garbage from a wrong password. Smudge now outputs decrypted
+  content only if openssl succeeds and the plaintext reproduces the salt stored
+  in the ciphertext, and otherwise leaves the file encrypted. Previously a wrong
+  password wrote garbage followed by the ciphertext, and about 1 in 256 files
+  silently decrypted to garbage alone. Textconv likewise shows only ciphertext
+  on failure (#113, #182, #191)
+- Smudge no longer truncates unencrypted content larger than about 64 KiB
+- Clean filter tests the content git passes it rather than the working-tree
+  file, which with `merge.renormalize` silently resolved modify/delete and
+  rename/edit conflicts on encrypted files as deletions during merge, rebase
+  and stash pop
+- Merge driver no longer overwrites the working-tree file, which destroyed
+  uncommitted edits during cherry-pick, revert and stash pop, and no longer
+  strips NUL bytes and trailing newlines from merged files. Binary encrypted
+  files now conflict instead of merging corrupted content
 
 - Fix error in pre-commit hook's "fast" multi-threaded mode when `nproc` is not
   installed but `bash` 4.4+ is: fall back to 1 thread (#197)

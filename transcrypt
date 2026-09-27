@@ -265,19 +265,61 @@ hex_to_bin() {
 	fi
 }
 
+# Print the salt (16 hex characters) that git_clean derives for the plaintext
+# in file $4 stored at repository path $2
+derive_salt() {
+	local openssl_path=$1 filename=$2 password=$3 file=$4
+	"${openssl_path}" dgst -hmac "${filename}:${password}" -sha256 "$file" | tr -d '\r\n' | tail -c16
+}
+
+# Print the salt (16 hex characters) stored in the 'Salted__' header of the
+# base64 ciphertext in file $2
+read_header_salt() {
+	local openssl_path=$1 file=$2
+	{
+		head -c24 "$file"
+		echo
+	} | "${openssl_path}" base64 -d 2>/dev/null | head -c16 | tail -c8 | od -An -tx1 | tr -d ' \n'
+}
+
+# Decrypt the base64 ciphertext in file $4 into file $5, succeeding only if the
+# result is certainly correct. A wrong password passes CBC's padding check by
+# chance about once in 256 files, so openssl's exit status alone isn't enough.
+# Because encryption is deterministic, the right password always reproduces
+# the salt in the ciphertext header from the plaintext and the file's
+# repository path ($6), while a wrong one practically never does. Without a
+# path, only openssl's own check is applied.
+decrypt_verified() {
+	local cipher=$1 password=$2 openssl_path=$3 infile=$4 outfile=$5 filename=${6:-}
+	[[ $cipher && $password ]] || return 1
+	ENC_PASS=$password "${openssl_path}" enc -d "-${cipher}" -md MD5 -pass env:ENC_PASS -a -in "$infile" -out "$outfile" 2>/dev/null || return 1
+	if [[ $filename ]]; then
+		[[ "$(derive_salt "$openssl_path" "$filename" "$password" "$outfile")" == "$(read_header_salt "$openssl_path" "$infile")" ]] || return 1
+	fi
+}
+
+# Succeed if file $1 starts with the base64 of 'Salted__', like all transcrypt ciphertext
+is_ciphertext() {
+	# The `head + LC_ALL=C tr` command handles binary data in old and new Bash (#116)
+	[[ "$(head -c8 "$1" | LC_ALL=C tr -d '\0')" == "U2FsdGVk" ]]
+}
+
 git_clean() {
 	context=$(extract_context_name_from_name_value_arg "$1")
 	[[ "$context" ]] && shift
 
 	filename=$1
-	# ignore empty files
-	if [[ ! -s $filename ]]; then
-		return
-	fi
 	# cache STDIN to test if it's already encrypted
 	tempfile=$(mktemp 2>/dev/null || mktemp -t tmp)
 	trap 'rm -f "$tempfile"' EXIT
 	tee "$tempfile" &>/dev/null
+	# ignore empty content. Test the content git passed in, not the working-tree
+	# file: when merging with merge.renormalize, git cleans historical versions
+	# of paths that may be missing or empty in the working tree, and treating
+	# those versions as empty turned modify/delete conflicts into silent deletes
+	if [[ ! -s $tempfile ]]; then
+		return
+	fi
 	# the first bytes of an encrypted file are always "Salted" in Base64
 	# The `head + LC_ALL=C tr` command handles binary data in old and new Bash (#116)
 	firstbytes=$(head -c8 "$tempfile" | LC_ALL=C tr -d '\0')
@@ -288,7 +330,7 @@ git_clean() {
 		cipher=$(git config --get --local "transcrypt${context_config_group}.cipher")
 		password=$(load_password "$context_config_group")
 		openssl_path=$(git config --get --local transcrypt.openssl-path)
-		salt=$("${openssl_path}" dgst -hmac "${filename}:${password}" -sha256 "$tempfile" | tr -d '\r\n' | tail -c16)
+		salt=$(derive_salt "$openssl_path" "$filename" "$password" "$tempfile")
 
 		if [ "$(is_salt_prefix_workaround_required)" == "true" ]; then
 			# Encrypt the file to base64, ensuring it includes the prefix 'Salted__' with the salt. #133
@@ -307,13 +349,37 @@ git_clean() {
 
 git_smudge() {
 	tempfile=$(mktemp 2>/dev/null || mktemp -t tmp)
-	trap 'rm -f "$tempfile"' EXIT
+	plainfile=$(mktemp 2>/dev/null || mktemp -t tmp)
+	trap 'rm -f "$tempfile" "$plainfile"' EXIT
 	context=$(extract_context_name_from_name_value_arg "$1")
+	[[ "$context" ]] && shift
+	# repository path of the file, passed by git as %f. Older configurations
+	# don't pass it; `transcrypt --upgrade` adds it
+	filename=${1:-}
+
+	# Read all input before deciding what to output, so nothing is emitted
+	# from a failed decryption and nothing is truncated
+	cat >"$tempfile"
+	# content that isn't transcrypt ciphertext (e.g. a file committed from a
+	# clone without transcrypt) is passed through unchanged
+	if ! is_ciphertext "$tempfile"; then
+		cat "$tempfile"
+		return
+	fi
+
 	context_config_group=$(derive_context_config_group "$context")
 	cipher=$(git config --get --local "transcrypt${context_config_group}.cipher")
 	password=$(load_password "$context_config_group")
 	openssl_path=$(git config --get --local transcrypt.openssl-path)
-	tee "$tempfile" | ENC_PASS=$password "$openssl_path" enc -d "-${cipher}" -md MD5 -pass env:ENC_PASS -a 2>/dev/null || cat "$tempfile"
+	if decrypt_verified "$cipher" "$password" "$openssl_path" "$tempfile" "$plainfile" "$filename"; then
+		cat "$plainfile"
+	else
+		# Never write a guess: leave the file encrypted. The clean filter passes
+		# ciphertext through unchanged, so this can't corrupt the stored file
+		warn 'cannot decrypt %s with the configured password for context %s; leaving it encrypted (see transcrypt --verify)' \
+			"${filename:-file}" "${context:-default}"
+		cat "$tempfile"
+	fi
 }
 
 git_textconv() {
@@ -326,17 +392,28 @@ git_textconv() {
 		return
 	fi
 
+	plainfile=$(mktemp 2>/dev/null || mktemp -t tmp)
+	trap 'rm -f "$plainfile"' EXIT
 	context_config_group=$(derive_context_config_group "$context")
 	cipher=$(git config --get --local "transcrypt${context_config_group}.cipher")
 	password=$(load_password "$context_config_group")
 	openssl_path=$(git config --get --local transcrypt.openssl-path)
-	ENC_PASS=$password "$openssl_path" enc -d "-${cipher}" -md MD5 -pass env:ENC_PASS -a -in "$filename" 2>/dev/null || cat "$filename"
+	# git passes a temporary file here, not the repository path, so only
+	# openssl's own check is possible. Show ciphertext rather than partial output
+	if decrypt_verified "$cipher" "$password" "$openssl_path" "$filename" "$plainfile"; then
+		cat "$plainfile"
+	else
+		cat "$filename"
+	fi
 }
 
-# shellcheck disable=SC2005,SC2002,SC2181
 git_merge() {
 	context=$(extract_context_name_from_name_value_arg "$1")
 	[[ "$context" ]] && shift
+
+	# Git's temporary files for the BASE ($1), LOCAL ($2) and REMOTE ($3)
+	# versions, the conflict marker size ($4) and the file's repository path ($5)
+	local base=$1 ours=$2 theirs=$3 marker_size=$4 path=$5
 
 	# Get path to transcrypt in this script's directory
 	TRANSCRYPT_PATH="$(dirname "$0")/transcrypt"
@@ -351,29 +428,52 @@ git_merge() {
 	if [[ ! "${THEIRS_LABEL:-}" ]]; then
 		THEIRS_LABEL="theirs"
 	fi
-	# Decrypt BASE $1, LOCAL $2, and REMOTE $3 versions of file being merged
-	echo "$(cat "$1" | "${TRANSCRYPT_PATH}" smudge context="$context")" >"$1"
-	echo "$(cat "$2" | "${TRANSCRYPT_PATH}" smudge context="$context")" >"$2"
-	echo "$(cat "$3" | "${TRANSCRYPT_PATH}" smudge context="$context")" >"$3"
-	# Merge the decrypted files to the temp file named by $2
-	git merge-file --marker-size="$4" -L "$OURS_LABEL" -L base -L "$THEIRS_LABEL" "$2" "$1" "$3"
-	# If the merge was not successful (has conflicts) exit with an error code to
-	# leave the partially-merged file in place for a manual merge.
-	if [[ "$?" != "0" ]]; then
+
+	context_config_group=$(derive_context_config_group "$context")
+	cipher=$(git config --get --local "transcrypt${context_config_group}.cipher")
+	password=$(load_password "$context_config_group")
+	openssl_path=$(git config --get --local transcrypt.openssl-path)
+
+	# Decrypt each version into a private temporary file. Content only ever
+	# moves between files: command substitution would drop NUL bytes and
+	# trailing newlines
+	plain_base=$(mktemp 2>/dev/null || mktemp -t tmp)
+	plain_ours=$(mktemp 2>/dev/null || mktemp -t tmp)
+	plain_theirs=$(mktemp 2>/dev/null || mktemp -t tmp)
+	trap 'rm -f "$plain_base" "$plain_ours" "$plain_theirs"' EXIT
+	local version plain src
+	for version in base ours theirs; do
+		case $version in
+		base) plain=$plain_base src=$base ;;
+		ours) plain=$plain_ours src=$ours ;;
+		theirs) plain=$plain_theirs src=$theirs ;;
+		esac
+		if ! is_ciphertext "$src"; then
+			# Empty or never-encrypted content is merged as it is
+			cat "$src" >"$plain"
+		elif ! decrypt_verified "$cipher" "$password" "$openssl_path" "$src" "$plain" "$path"; then
+			# Leave the LOCAL version untouched, so git records a conflict
+			# with the file still encrypted, rather than merging a guess
+			warn 'cannot decrypt the %s version of %s with the configured password; not merging it' "$version" "$path"
+			exit 1
+		fi
+	done
+
+	# Merge the decrypted versions. If that fails (conflicts, or binary content
+	# git can't merge), hand git the partially-merged file for a manual merge
+	if ! git merge-file --marker-size="$marker_size" -L "$OURS_LABEL" -L base -L "$THEIRS_LABEL" \
+		"$plain_ours" "$plain_base" "$plain_theirs"; then
+		cat "$plain_ours" >"$ours"
 		exit 1
 	fi
-	# If the merge was successful (no conflicts) re-encrypt the merged temp file $2
-	# which git will then update in the index in a following "Auto-merging" step.
+	# If the merge was successful (no conflicts) re-encrypt the merged result into
+	# $2 which git will then update in the index in a following "Auto-merging" step.
 	# We must explicitly encrypt/clean the file, rather than leave Git to do it,
 	# because we can otherwise trigger safety check failure errors like:
 	#     error: add_cacheinfo failed to refresh for path 'FILE'; merge aborting.
-	# To re-encrypt we must first copy the merged file to $5 (the name of the
-	# working-copy file) so the crypt `clean` script can generate the correct hash
-	# salt based on the file's real name, instead of the $2 temp file name.
-	cp "$2" "$5"
-	# Now we use the `clean` script to encrypt the merged file contents back to the
-	# temp file $2 where Git expects to find the merge result content.
-	cat "$5" | "${TRANSCRYPT_PATH}" clean context="$context" "$5" >"$2"
+	# The clean filter takes the content on stdin and uses the repository path
+	# only to derive the salt, so the working-tree file is never touched.
+	"${TRANSCRYPT_PATH}" clean context="$context" "$path" <"$plain_ours" >"$ours"
 }
 
 # shellcheck disable=SC2155
@@ -728,14 +828,14 @@ save_configuration() {
 
 	# Ensure filter attributes are always set for the default (unspecified) context
 	git config filter.crypt.clean "$transcrypt_path clean context=default %f"
-	git config filter.crypt.smudge "$transcrypt_path smudge context=default"
+	git config filter.crypt.smudge "$transcrypt_path smudge context=default %f"
 	git config diff.crypt.textconv "$transcrypt_path textconv context=default"
 	git config merge.crypt.driver "$transcrypt_path merge context=default %O %A %B %L %P"
 
 	# Also set filter attributes for a non-default context, if necessary
 	if [[ ! "$CONTEXT" = 'default' ]]; then
 		git config filter.crypt"${CONTEXT_CRYPT_SUFFIX}".clean "$transcrypt_path clean context=$CONTEXT %f"
-		git config filter.crypt"${CONTEXT_CRYPT_SUFFIX}".smudge "$transcrypt_path smudge context=$CONTEXT"
+		git config filter.crypt"${CONTEXT_CRYPT_SUFFIX}".smudge "$transcrypt_path smudge context=$CONTEXT %f"
 		git config diff.crypt"${CONTEXT_CRYPT_SUFFIX}".textconv "$transcrypt_path textconv context=$CONTEXT"
 		git config merge.crypt"${CONTEXT_CRYPT_SUFFIX}".driver "$transcrypt_path merge context=$CONTEXT %O %A %B %L %P"
 	fi
@@ -1064,6 +1164,100 @@ upgrade_transcrypt() {
 	fi
 }
 
+# Classify the committed (HEAD) version of encrypted file $1 against the
+# current $cipher, $password and $openssl_path, using scratch files $2 and $3.
+# Prints one of:
+#   ok          decrypts, and verifies against its path
+#   skip        empty, or not committed yet
+#   plaintext   stored unencrypted
+#   unverified  decrypts, but not to content that reproduces its salt: it was
+#               encrypted under another path (e.g. moved with `git mv`), or
+#               with another password
+#   wrong       does not decrypt with this password
+classify_committed_file() {
+	local file=$1 blob=$2 plain=$3
+	if ! git cat-file blob "HEAD:$file" >"$blob" 2>/dev/null || [[ ! -s $blob ]]; then
+		echo 'skip'
+	elif ! is_ciphertext "$blob"; then
+		echo 'plaintext'
+	elif decrypt_verified "$cipher" "$password" "$openssl_path" "$blob" "$plain" "$file"; then
+		echo 'ok'
+	elif decrypt_verified "$cipher" "$password" "$openssl_path" "$blob" "$plain"; then
+		echo 'unverified'
+	else
+		echo 'wrong'
+	fi
+}
+
+# Before any configuration is saved, make sure the password decrypts the
+# encrypted files already committed for this context. The smudge filter leaves
+# files it can't decrypt encrypted, so a wrong password would otherwise go
+# unnoticed until something fails to decrypt later
+verify_password_against_repo() {
+	[[ $HEAD_EXISTS ]] || return 0
+	local file blob plain checked=0
+	blob=$(mktemp 2>/dev/null || mktemp -t tmp)
+	plain=$(mktemp 2>/dev/null || mktemp -t tmp)
+	local IFS=$'\n'
+	for file in $(_list_encrypted_files true); do
+		case $(classify_committed_file "$file" "$blob" "$plain") in
+		ok)
+			rm -f "$blob" "$plain"
+			return 0
+			;;
+		unverified | wrong)
+			checked=$((checked + 1))
+			;;
+		esac
+	done
+	rm -f "$blob" "$plain"
+	if [[ $checked -gt 0 ]]; then
+		die 1 'the password does not decrypt the encrypted files committed%s (%s checked); nothing was changed' "$CONTEXT_DESCRIPTION" "$checked"
+	fi
+}
+
+# check that every committed encrypted file for the context is stored
+# encrypted and decrypts with the configured password
+# shellcheck disable=SC2016
+verify_files() {
+	local file blob plain result problems=0
+	cipher=$(git config --get --local "transcrypt${CONTEXT_CONFIG_GROUP}.cipher")
+	password=$(load_password "$CONTEXT_CONFIG_GROUP")
+	openssl_path=$(git config --get --local transcrypt.openssl-path)
+	[[ $HEAD_EXISTS ]] || return 0
+	blob=$(mktemp 2>/dev/null || mktemp -t tmp)
+	plain=$(mktemp 2>/dev/null || mktemp -t tmp)
+	local IFS=$'\n'
+	for file in $(_list_encrypted_files true); do
+		result=$(classify_committed_file "$file" "$blob" "$plain")
+		case $result in
+		plaintext)
+			printf 'NOT ENCRYPTED  %s\n' "$file"
+			;;
+		unverified)
+			printf 'UNVERIFIED     %s\n' "$file"
+			;;
+		wrong)
+			printf 'UNDECRYPTABLE  %s\n' "$file"
+			;;
+		esac
+		[[ $result == 'ok' || $result == 'skip' ]] || problems=$((problems + 1))
+	done
+	rm -f "$blob" "$plain"
+	if [[ $problems -gt 0 ]]; then
+		printf '\n'
+		printf 'NOT ENCRYPTED: committed in plaintext; remove it from history and rotate its secret.\n'
+		printf 'UNVERIFIED:    decrypts, but was encrypted under another path (e.g. moved with\n'
+		printf '               `git mv`) or with another password, so checkouts leave it encrypted.\n'
+		printf '               If the decrypted content is right, re-encrypt it under its path:\n'
+		printf '                 git show HEAD:FILE | openssl enc -d -%s -md MD5 -a \\\n' "$cipher"
+		printf '                   -pass "pass:$(git config transcrypt%s.password)" >FILE && git add FILE\n' "$CONTEXT_CONFIG_GROUP"
+		printf 'UNDECRYPTABLE: does not decrypt with the configured password.\n'
+		die 1 '%s of the committed encrypted files%s have problems' "$problems" "$CONTEXT_DESCRIPTION"
+	fi
+	printf 'All committed encrypted files%s decrypt and verify.\n' "$CONTEXT_DESCRIPTION"
+}
+
 # list all of the currently encrypted files in the repository
 list_files() {
 	if [[ $IS_BARE == 'false' ]]; then
@@ -1359,6 +1553,11 @@ help() {
 		            list all contexts configured in the  repository,  and warn about
 		            incompletely configured contexts
 
+		     --verify
+		            check that  every committed  encrypted file  is stored encrypted
+		            and decrypts  with the configured password;  use --context  to
+		            check a context other than 'default'
+
 		     -v, --version
 		            print the version information
 
@@ -1455,6 +1654,7 @@ gpg_recipient=''
 interactive='true'
 list=''
 password=''
+verify=''
 rekey=''
 show_file=''
 uninstall=''
@@ -1571,6 +1771,11 @@ while [[ "${1:-}" != '' ]]; do
 		list_contexts_command='true'
 		requires_clean_repo=''
 		;;
+	--verify)
+		verify='true'
+		requires_existing_config='true'
+		requires_clean_repo=''
+		;;
 	-s | --show-raw)
 		show_file=${2:-}
 		[[ $show_file ]] || die 1 'empty file path'
@@ -1674,6 +1879,9 @@ elif [[ $display_config ]]; then
 elif [[ $list_contexts_command ]]; then
 	list_contexts
 	exit 0
+elif [[ $verify ]]; then
+	verify_files
+	exit 0
 elif [[ $flush_creds ]]; then
 	flush_credentials
 	exit 0
@@ -1696,6 +1904,11 @@ readonly GIT_DIRTY_FILES_BEFORE_INIT="$(count_dirty_files)"
 # perform function calls to configure transcrypt
 get_cipher
 get_password
+
+# a new password for --rekey can't be checked against existing files
+if [[ ! $rekey ]]; then
+	verify_password_against_repo
+fi
 
 if [[ $rekey ]] && [[ $interactive ]]; then
 	confirm_rekey

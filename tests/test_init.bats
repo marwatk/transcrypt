@@ -39,7 +39,7 @@ SETUP_SKIP_INIT_TRANSCRYPT=1
   # Use --git-common-dir if available (Git post Nov 2014) otherwise --git-dir
   # shellcheck disable=SC2016
   [ "$(git config --get filter.crypt.clean)" = '"$(git config transcrypt.crypt-dir 2>/dev/null || printf ''%s/crypt'' ""$(git rev-parse --git-common-dir)"")"/transcrypt clean context=default %f' ]
-  [ "$(git config --get filter.crypt.smudge)" = '"$(git config transcrypt.crypt-dir 2>/dev/null || printf ''%s/crypt'' ""$(git rev-parse --git-common-dir)"")"/transcrypt smudge context=default' ]
+  [ "$(git config --get filter.crypt.smudge)" = '"$(git config transcrypt.crypt-dir 2>/dev/null || printf ''%s/crypt'' ""$(git rev-parse --git-common-dir)"")"/transcrypt smudge context=default %f' ]
   [ "$(git config --get diff.crypt.textconv)" = '"$(git config transcrypt.crypt-dir 2>/dev/null || printf ''%s/crypt'' ""$(git rev-parse --git-common-dir)"")"/transcrypt textconv context=default' ]
   [ "$(git config --get merge.crypt.driver)" = '"$(git config transcrypt.crypt-dir 2>/dev/null || printf ''%s/crypt'' ""$(git rev-parse --git-common-dir)"")"/transcrypt merge context=default %O %A %B %L %P' ]
 
@@ -216,7 +216,7 @@ SETUP_SKIP_INIT_TRANSCRYPT=1
   [ "${lines[1]}" = "$SECRET_CONTENT_ENC" ]
 }
 
-@test "crypt: warn on incorrect password as indicated by dirty files after init" {
+@test "crypt: refuse an incorrect password on init" {
   init_transcrypt
 
   SECRET_CONTENT="My secret content"
@@ -228,13 +228,18 @@ SETUP_SKIP_INIT_TRANSCRYPT=1
   uninstall_transcrypt
   git reset --hard
 
-  # Init transcrypt with wrong password, command fails with error message
+  # Init transcrypt with wrong password, command fails before saving anything
   run $TRANSCRYPT --cipher=aes-256-cbc --password='WRONG' --yes
   [ "$status" -eq 1 ]
-  [ "${lines[0]}" = "transcrypt: Unexpected new dirty files in the repository when configured by transcrypt, please check your password." ]
+  [ "${lines[0]}" = "transcrypt: the password does not decrypt the encrypted files committed (1 checked); nothing was changed" ]
+
+  # Nothing was configured, and the file is untouched
+  run git config --get transcrypt.password
+  [ "$status" -eq 1 ]
+  [ "$(git show HEAD:sensitive_file --no-textconv)" = "$(cat sensitive_file)" ]
 }
 
-@test "crypt: warn on incorrect password as indicated by dirty files after init when forced" {
+@test "crypt: refuse an incorrect password on init when forced" {
   init_transcrypt
 
   SECRET_CONTENT="My secret content"
@@ -251,10 +256,15 @@ SETUP_SKIP_INIT_TRANSCRYPT=1
   echo "Dirty file" > dirty_file
   git add dirty_file
 
-  # Force init transcrypt with wrong password, command fails with error message
+  # Force init transcrypt with wrong password, command fails before saving anything
   run $TRANSCRYPT --force --cipher=aes-256-cbc --password='WRONG' --yes
   [ "$status" -eq 1 ]
-  [ "${lines[0]}" = "transcrypt: Unexpected new dirty files in the repository when configured by transcrypt, please check your password." ]
+  [ "${lines[0]}" = "transcrypt: the password does not decrypt the encrypted files committed (1 checked); nothing was changed" ]
+
+  # Nothing was configured, and the file is untouched
+  run git config --get transcrypt.password
+  [ "$status" -eq 1 ]
+  [ "$(git show HEAD:sensitive_file --no-textconv)" = "$(cat sensitive_file)" ]
 
   rm dirty_file
 }
