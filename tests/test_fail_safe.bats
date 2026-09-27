@@ -199,3 +199,97 @@ function stored {
   [[ "$output" == *"NOT ENCRYPTED  plain_file"* ]]
   [[ "$output" != *"sensitive_file"* ]]
 }
+
+@test "fail-safe: --verify works from a subdirectory" {
+  mkdir sub
+  encrypt_named_file sensitive_file "My secret content"
+  cd sub
+
+  run "$TRANSCRYPT" --verify
+  [ "$status" -eq 0 ]
+  [ "$output" = "All committed encrypted files decrypt and verify." ]
+}
+
+@test "fail-safe: --rekey handles names with spaces and never stages unrelated files" {
+  encrypt_named_file "api keys.json" "API_KEY=1"
+  echo "untracked plaintext" > keys.json
+
+  run "$TRANSCRYPT" --rekey --password='new password' --yes
+  [ "$status" -eq 0 ]
+  [ ! -e api ]
+  [ "$(git diff --cached --name-only)" = "api keys.json" ]
+  git commit -q -m "Rekey"
+
+  git show 'HEAD:api keys.json' --no-textconv > ciphertext
+  ENC_PASS='new password' openssl enc -d -aes-256-cbc -md MD5 -pass env:ENC_PASS -a -in ciphertext > plaintext 2>/dev/null
+  [ "$(cat plaintext)" = "API_KEY=1" ]
+}
+
+@test "fail-safe: --upgrade creates no stray files for names with spaces" {
+  encrypt_named_file "a b.env" "A=1"
+
+  run "$TRANSCRYPT" --upgrade --yes
+  [ "$status" -eq 0 ]
+  [ ! -e a ]
+  [ ! -e b.env ]
+  [ -z "$(git status --porcelain)" ]
+}
+
+@test "fail-safe: --upgrade completes with other files in the crypt directory" {
+  encrypt_named_file sensitive_file "My secret content"
+  # e.g. left behind by --export-gpg
+  echo "exported" > .git/crypt/someone@example.com.asc
+
+  run "$TRANSCRYPT" --upgrade --yes
+  [ "$status" -eq 0 ]
+  [ -x .git/crypt/transcrypt ]
+  [ "$(git config --get filter.crypt.required)" = "true" ]
+  [ -f .git/crypt/someone@example.com.asc ]
+}
+
+@test "fail-safe: --uninstall completes when merge.renormalize is already unset" {
+  encrypt_named_file sensitive_file "My secret content"
+  git config --unset merge.renormalize
+
+  run "$TRANSCRYPT" --uninstall --yes
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"completely removed"* ]]
+  run grep -c "filter=crypt" .gitattributes
+  [ "$output" = "0" ]
+}
+
+@test "fail-safe: --upgrade keeps passwords containing '|'" {
+  "$TRANSCRYPT" --flush-credentials --yes > /dev/null
+  "$TRANSCRYPT" --cipher=aes-256-cbc --password='a|b|c' --yes > /dev/null
+  encrypt_named_file sensitive_file "My secret content"
+
+  run "$TRANSCRYPT" --upgrade --yes
+  [ "$status" -eq 0 ]
+  [ "$(git config --get transcrypt.password)" = 'a|b|c' ]
+}
+
+@test "fail-safe: --flush-credentials never deletes untracked files with glob-like names" {
+  # The brackets are escaped so the pattern matches the literal name
+  printf '%s\n' 'key\[12\].env filter=crypt diff=crypt merge=crypt' >> .gitattributes
+  echo "KEY=1" > "key[12].env"
+  git add .gitattributes "key[12].env"
+  git commit -q -m "Add key[12].env"
+  echo "untracked" > key1.env
+
+  run "$TRANSCRYPT" --flush-credentials --yes
+  [ "$status" -eq 0 ]
+  [ "$(cat key1.env)" = "untracked" ]
+  [ "$(cat 'key[12].env')" = "$(git show 'HEAD:key[12].env' --no-textconv)" ]
+}
+
+@test "fail-safe: forced init keeps a staged but uncommitted encrypted file" {
+  encrypt_named_file sensitive_file "My secret content"
+  "$TRANSCRYPT" --flush-credentials --yes > /dev/null
+  echo '"new.env" filter=crypt diff=crypt merge=crypt' >> .gitattributes
+  echo "NEW=1" > new.env
+  git add .gitattributes new.env
+
+  run "$TRANSCRYPT" --force --cipher=aes-256-cbc --password='abc 123' --yes
+  [ "$status" -eq 0 ]
+  [ -f new.env ]
+}

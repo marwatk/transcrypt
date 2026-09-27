@@ -65,6 +65,18 @@ system, you must also run the `--upgrade` command in each repository:
   uncommitted edits during cherry-pick, revert and stash pop, and no longer
   strips NUL bytes and trailing newlines from merged files. Binary encrypted
   files now conflict instead of merging corrupted content
+- `--rekey`, `--uninstall`, `--upgrade`, `--flush-credentials` and init handle
+  encrypted file names exactly. Names with spaces were split into stray empty
+  files and could stage unrelated untracked files, `--rekey` left them on the
+  old password, and names with glob characters made init and flush delete
+  unrelated untracked files
+- `--rekey` warns about encrypted files missing from the working tree (e.g.
+  outside a sparse checkout) instead of committing them empty
+- Init with `--force` no longer deletes a staged but uncommitted encrypted file
+- `--upgrade` no longer truncates passwords containing `|`, and `--uninstall`
+  and `--upgrade` no longer abort halfway when the crypt directory holds other
+  files (e.g. from `--export-gpg`) or `merge.renormalize` is already unset
+- `--verify` and the init password check work when run from a subdirectory
 
 - Fix error in pre-commit hook's "fast" multi-threaded mode when `nproc` is not
   installed but `bash` 4.4+ is: fall back to 1 thread (#197)

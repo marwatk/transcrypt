@@ -218,6 +218,43 @@ _list_encrypted_files() {
 		while read -r filename; do eval 'echo $filename'; done
 }
 
+# Print the paths of encrypted files exactly as git stores them, each followed
+# by a NUL byte, relative to the current directory (normally the repository
+# root). Matches the current context strictly (if $1 = "true") or loosely (if
+# $1 is false or unset), like _list_encrypted_files
+_list_encrypted_files_z() {
+	local strict_context=${1:-} path attr info
+	git -c core.quotePath=false ls-files -z |
+		git -c core.quotePath=false check-attr filter -z --stdin 2>/dev/null |
+		while IFS= read -r -d '' path && IFS= read -r -d '' attr && IFS= read -r -d '' info; do
+			if [[ $info == "crypt${CONTEXT_CRYPT_SUFFIX:-}" ]] ||
+				{ [[ $strict_context != 'true' ]] && [[ $info == "crypt${CONTEXT_CRYPT_SUFFIX:-}"* ]]; }; then
+				printf '%s\0' "$path"
+			fi
+		done
+}
+
+# Load the paths of encrypted files into the ENCRYPTED_FILES array, without
+# any word splitting or globbing of file names. Run from the repository root.
+# Matches strictly (if $1 = "true") or loosely (if $1 is false or unset)
+load_encrypted_files() {
+	local file
+	ENCRYPTED_FILES=()
+	while IFS= read -r -d '' file; do
+		ENCRYPTED_FILES+=("$file")
+	done < <(_list_encrypted_files_z "${1:-}")
+}
+
+# Load the encrypted files for the current context into ENCRYPTED_FILES: all
+# contexts' files for the default context, like --list, otherwise strictly
+load_context_encrypted_files() {
+	if [[ -z "$CONTEXT_CRYPT_SUFFIX" ]]; then
+		load_encrypted_files
+	else
+		load_encrypted_files true
+	fi
+}
+
 # Detect OpenSSL major version 3 or later which requires a compatibility
 # work-around to include the prefix 'Salted__' and salt value when encrypting.
 #
@@ -730,18 +767,31 @@ confirm_rekey() {
 
 # automatically stage rekeyed files in preparation for the user to commit them
 stage_rekeyed_files() {
-	local encrypted_files
-	encrypted_files=$(git ls-crypt)
-	if [[ $encrypted_files ]] && [[ $IS_BARE == 'false' ]]; then
+	[[ $IS_BARE == 'false' ]] || return 0
+	cd "$REPO" >/dev/null || die 1 'could not change into the "%s" directory' "$REPO"
+	load_context_encrypted_files
+	local file present=() missing=()
+	if [[ ${#ENCRYPTED_FILES[@]} -gt 0 ]]; then
+		for file in "${ENCRYPTED_FILES[@]}"; do
+			if [[ -e $file ]]; then
+				present+=("$file")
+			else
+				missing+=("$file")
+			fi
+		done
+	fi
+	if [[ ${#present[@]} -gt 0 ]]; then
 		# touch all encrypted files to prevent stale stat info
-		cd "$REPO" >/dev/null || die 1 'could not change into the "%s" directory' "$REPO"
-		# shellcheck disable=SC2086
-		touch $encrypted_files
-		# shellcheck disable=SC2086
-		git update-index --add -- $encrypted_files
+		touch -c -- "${present[@]}"
+		printf '%s\0' "${present[@]}" | git update-index --add -z --stdin
 
 		printf '***  rekeyed files have been staged  ***\n'
 		printf '*** COMMIT THESE CHANGES RIGHT AWAY! ***\n\n'
+	fi
+	if [[ ${#missing[@]} -gt 0 ]]; then
+		# e.g. outside a sparse checkout. Staging these would commit them empty
+		warn 'these encrypted files are not in the working tree, so they were NOT re-encrypted with the new password:'
+		printf '  %s\n' "${missing[@]}" >&2
 	fi
 }
 
@@ -922,15 +972,18 @@ force_checkout() {
 	if [[ $HEAD_EXISTS ]] && [[ $IS_BARE == 'false' ]]; then
 		# this would normally delete uncommitted changes in the working directory,
 		# but we already made sure the repo was clean during the safety checks
-		local encrypted_files
-		encrypted_files=$(git "ls-crypt-${CONTEXT}")
 		cd "$REPO" >/dev/null || die 1 'could not change into the "%s" directory' "$REPO"
-		IFS=$'\n'
-		for file in $encrypted_files; do
-			rm -f "$file"
-			git checkout --force HEAD -- "$file" >/dev/null
-		done
-		unset IFS
+		load_context_encrypted_files
+		local file
+		if [[ ${#ENCRYPTED_FILES[@]} -gt 0 ]]; then
+			for file in "${ENCRYPTED_FILES[@]}"; do
+				# skip files not committed yet: there is nothing to check out, and
+				# removing them would lose their only copy
+				git cat-file -e "HEAD:$file" 2>/dev/null || continue
+				rm -f "$file"
+				git checkout --force HEAD -- ":(literal)$file" >/dev/null
+			done
+		fi
 	fi
 }
 
@@ -1003,13 +1056,14 @@ uninstall_transcrypt() {
 			remove_cached_plaintext
 		fi
 
-		# touch all encrypted files to prevent stale stat info
-		local encrypted_files
-		encrypted_files=$(git ls-crypt)
-		if [[ $encrypted_files ]] && [[ $IS_BARE == 'false' ]]; then
+		# touch all encrypted files to prevent stale stat info. Not needed when
+		# upgrading, which keeps the same configuration
+		if [[ ! $upgrade ]] && [[ $IS_BARE == 'false' ]]; then
 			cd "$REPO" >/dev/null || die 1 'could not change into the "%s" directory' "$REPO"
-			# shellcheck disable=SC2086
-			touch $encrypted_files
+			load_encrypted_files
+			if [[ ${#ENCRYPTED_FILES[@]} -gt 0 ]]; then
+				touch -c -- "${ENCRYPTED_FILES[@]}"
+			fi
 		fi
 
 		# remove helper scripts
@@ -1017,7 +1071,10 @@ uninstall_transcrypt() {
 		for script in {transcrypt,clean,smudge,textconv,merge}; do
 			[[ ! -f "${CRYPT_DIR}/${script}" ]] || rm "${CRYPT_DIR}/${script}"
 		done
-		[[ ! -d "${CRYPT_DIR}" ]] || rmdir "${CRYPT_DIR}"
+		# keep the directory if it holds other files, e.g. from --export-gpg
+		if [[ -d "${CRYPT_DIR}" ]] && ! rmdir "${CRYPT_DIR}" 2>/dev/null; then
+			[[ $upgrade ]] || warn 'left %s in place because it contains other files' "$CRYPT_DIR"
+		fi
 
 		# rename helper hooks (don't delete, in case user has custom changes)
 		pre_commit_hook="${GIT_HOOKS}/pre-commit"
@@ -1067,7 +1124,7 @@ uninstall_transcrypt() {
 		local transcrypt_values
 		transcrypt_values=$(git config --get-regex --local 'transcrypt\..*') || true
 		if [[ ! $transcrypt_values ]]; then
-			git config --unset merge.renormalize
+			git config --unset merge.renormalize 2>/dev/null || true
 		fi
 
 		# remove the merge section if it's now empty
@@ -1123,8 +1180,11 @@ upgrade_transcrypt() {
 	# Keep contents of .gitattributes
 	ORIG_GITATTRIBUTES=$(cat "$GIT_ATTRIBUTES")
 
-	# Keep current cipher and password for each context
-	ORIG_CONFIGS=()
+	# Keep current cipher and password for each context, in separate arrays so
+	# no character in a password can be mistaken for a separator
+	ORIG_CONTEXTS=()
+	ORIG_CIPHERS=()
+	ORIG_PASSWORDS=()
 	for context_name in $CONFIGURED_CONTEXTS; do
 		if [[ "$context_name" = 'default' ]]; then
 			cipher=$(git config --get --local transcrypt.cipher)
@@ -1133,16 +1193,19 @@ upgrade_transcrypt() {
 			cipher=$(git config --get --local transcrypt."${context_name}".cipher)
 			password=$(git config --get --local transcrypt."${context_name}".password)
 		fi
-		ORIG_CONFIGS+=("${context_name}|${cipher}|${password}")
+		ORIG_CONTEXTS+=("$context_name")
+		ORIG_CIPHERS+=("$cipher")
+		ORIG_PASSWORDS+=("$password")
 	done
 
 	uninstall_transcrypt
 
 	# Reconfigure cipher and password for each context
-	for orig_config_line in "${ORIG_CONFIGS[@]}"; do
-		context=$(echo "$orig_config_line" | awk 'BEGIN { FS = "|" }; { print $1 }')
-		cipher=$(echo "$orig_config_line" | awk 'BEGIN { FS = "|" }; { print $2 }')
-		password=$(echo "$orig_config_line" | awk 'BEGIN { FS = "|" }; { print $3 }')
+	local i
+	for ((i = 0; i < ${#ORIG_CONTEXTS[@]}; i++)); do
+		context=${ORIG_CONTEXTS[$i]}
+		cipher=${ORIG_CIPHERS[$i]}
+		password=${ORIG_PASSWORDS[$i]}
 
 		set_context_globals # This prepares all the variables needed to save config
 		save_configuration
@@ -1194,12 +1257,14 @@ classify_committed_file() {
 # files it can't decrypt encrypted, so a wrong password would otherwise go
 # unnoticed until something fails to decrypt later
 verify_password_against_repo() {
-	[[ $HEAD_EXISTS ]] || return 0
+	[[ $HEAD_EXISTS ]] && [[ $IS_BARE == 'false' ]] || return 0
 	local file blob plain checked=0
+	cd "$REPO" >/dev/null || die 1 'could not change into the "%s" directory' "$REPO"
+	load_encrypted_files true
+	[[ ${#ENCRYPTED_FILES[@]} -gt 0 ]] || return 0
 	blob=$(mktemp 2>/dev/null || mktemp -t tmp)
 	plain=$(mktemp 2>/dev/null || mktemp -t tmp)
-	local IFS=$'\n'
-	for file in $(_list_encrypted_files true); do
+	for file in "${ENCRYPTED_FILES[@]}"; do
 		case $(classify_committed_file "$file" "$blob" "$plain") in
 		ok)
 			rm -f "$blob" "$plain"
@@ -1224,11 +1289,12 @@ verify_files() {
 	cipher=$(git config --get --local "transcrypt${CONTEXT_CONFIG_GROUP}.cipher")
 	password=$(load_password "$CONTEXT_CONFIG_GROUP")
 	openssl_path=$(git config --get --local transcrypt.openssl-path)
-	[[ $HEAD_EXISTS ]] || return 0
+	[[ $HEAD_EXISTS ]] && [[ $IS_BARE == 'false' ]] || return 0
+	cd "$REPO" >/dev/null || die 1 'could not change into the "%s" directory' "$REPO"
+	load_encrypted_files true
 	blob=$(mktemp 2>/dev/null || mktemp -t tmp)
 	plain=$(mktemp 2>/dev/null || mktemp -t tmp)
-	local IFS=$'\n'
-	for file in $(_list_encrypted_files true); do
+	for file in ${ENCRYPTED_FILES[@]+"${ENCRYPTED_FILES[@]}"}; do
 		result=$(classify_committed_file "$file" "$blob" "$plain")
 		case $result in
 		plaintext)
