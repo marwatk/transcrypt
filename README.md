@@ -109,8 +109,14 @@ transparently encrypted once you stage and commit it:
     $ git commit -m 'Add encrypted version of a sensitive file'
 
 The _.gitattributes_ file should be committed and tracked along with everything
-else in your repository so clones will be aware of what is encrypted. Make sure
-you don't accidentally add a pattern that would encrypt this file :-)
+else in your repository so clones will be aware of what is encrypted.
+
+Patterns follow gitattributes rules, which differ from _.gitignore_: a pattern
+for a directory matches nothing inside it. `transcrypt --add secrets/` adds
+`secrets/**` for you, quotes names containing spaces, and refuses patterns that
+would encrypt _.gitattributes_ itself. It also warns about matching files that
+are already in git unencrypted: their earlier commits keep the plaintext, so
+rotate those secrets.
 
 > For your reference, if you find the above description confusing, you'll find
 > that this repository has been configured following these exact steps.
@@ -211,7 +217,9 @@ directory.
              assume yes and accept defaults for non-specified options
 
       --add, --add=pattern
-             add a file pattern to encrypt to the .gitattributes file
+             add a file pattern to encrypt to the .gitattributes file;  repeat
+             to add several.  Paths are relative to the current directory, and
+             a directory adds dir/** to match all the files inside it
 
       -d, --display
              display the current repository's cipher and password

@@ -51,6 +51,10 @@ system, you must also run the `--upgrade` command in each repository:
 
 - `--verify` option: check that every committed encrypted file is stored
   encrypted and decrypts with the configured password
+- `--add` accepts several patterns (`--add a --add b`) and reports what it
+  matched: files already in git unencrypted (with how to encrypt them), no
+  matching files, and files that match only because the file system ignores
+  case, which won't be encrypted on case-sensitive systems
 
 ### Fixed
 
@@ -97,6 +101,18 @@ system, you must also run the `--upgrade` command in each repository:
   default context's
 - Content that starts like ciphertext (`U2FsdGVk`) is only stored as it is if
   it is entirely base64; other content is encrypted
+- `--add` writes patterns that match what was asked for: directories become
+  `dir/**` (a directory pattern matches nothing inside it), paths from a
+  subdirectory or absolute paths are made relative to the top level, names
+  with spaces are quoted, and a rule is no longer glued onto a last line
+  without a newline. Repeating `--add` kept only the last pattern, and an
+  empty `--add` added the pattern `1`
+- `--add` refuses patterns that would encrypt _.gitattributes_ itself, negative
+  and `..` patterns, a symlinked _.gitattributes_ (which git ignores), and an
+  unconfigured context
+- Write patterns to the repository's own attributes file, never to a global
+  `core.attributesFile`, whose patterns never reached other clones and which
+  `--uninstall` edited for every repository
 - Refuse ciphers that don't encrypt properly: only AES, ARIA and Camellia in
   CBC, CTR, CFB or OFB mode are accepted, for `--cipher`, interactive choice
   and `--import-gpg`. LibreSSL, the default `openssl` on macOS, previously

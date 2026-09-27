@@ -109,7 +109,10 @@ gather_repo_metadata() {
 
 	# the current git repository's gitattributes file
 	local CORE_ATTRIBUTES
-	CORE_ATTRIBUTES=$(git config --get --local --path core.attributesFile 2>/dev/null || git config --get --path core.attributesFile 2>/dev/null || printf '')
+	# Only a repository's own setting: patterns written to a global attributes
+	# file would never reach other clones, which would commit those files
+	# unencrypted, and uninstalling would edit every other repository's rules
+	CORE_ATTRIBUTES=$(git config --get --local --path core.attributesFile 2>/dev/null || printf '')
 	if [[ $CORE_ATTRIBUTES ]]; then
 		readonly GIT_ATTRIBUTES=$CORE_ATTRIBUTES
 	elif [[ $IS_BARE == 'true' ]] || [[ $IS_VCSH == 'true' ]]; then
@@ -606,13 +609,172 @@ git_pre_commit() {
 	unset IFS
 }
 
+# Print the paths of tracked and untracked (not ignored) files that have the
+# current context's crypt filter, each followed by a NUL byte. Arguments are
+# passed to `git` before `check-attr`, e.g. `-c core.ignorecase=false`
+_list_crypt_candidates_z() {
+	local path attr info
+	git -c core.quotePath=false ls-files -z --cached --others --exclude-standard |
+		git "$@" -c core.quotePath=false check-attr filter -z --stdin 2>/dev/null |
+		while IFS= read -r -d '' path && IFS= read -r -d '' attr && IFS= read -r -d '' info; do
+			if [[ $info == "crypt${CONTEXT_CRYPT_SUFFIX:-}" ]]; then
+				printf '%s\0' "$path"
+			fi
+		done
+}
+
+# Turn the --add argument $1, given relative to the directory prefix $2, into
+# a pattern for the top-level attributes file, or fail if it can't mean what
+# the user intended. gitattributes patterns differ from paths: a pattern for a
+# directory matches nothing inside it, and a pattern containing a slash is
+# relative to the attributes file, not the current directory
+normalize_pattern() {
+	local pattern=$1 prefix=$2 original=$1
+	if [[ $pattern == '!'* ]]; then
+		die 1 'gitattributes does not support negative patterns: %s' "$original"
+	fi
+	if [[ $pattern == /* ]]; then
+		# resolve symlinked directories, e.g. /tmp on macOS, as git does for REPO
+		local dir
+		if [[ $pattern != "$REPO"/* ]] && dir=$(cd "${pattern%/*}/" 2>/dev/null && pwd -P); then
+			pattern="$dir/${pattern##*/}"
+		fi
+		[[ $pattern == "$REPO"/* ]] || die 1 '"%s" is not inside the repository %s' "$original" "$REPO"
+		pattern=${pattern#"$REPO"/}
+	elif [[ $pattern == ./* ]] || [[ $pattern == */* ]]; then
+		while [[ $pattern == ./* ]]; do
+			pattern=${pattern#./}
+		done
+		pattern="$prefix$pattern"
+	fi
+	if [[ "/$pattern/" == */../* ]]; then
+		die 1 'give the pattern relative to the repository root, without "..": %s' "$original"
+	fi
+	# match the files inside a directory, recursively
+	if [[ $pattern == */ ]]; then
+		pattern="${pattern}**"
+	elif [[ $pattern != *[*?[]* ]] && [[ -d "$REPO/$pattern" ]]; then
+		pattern="${pattern%/}/**"
+	fi
+	[[ $pattern ]] || die 1 'empty pattern'
+	if [[ $pattern != "$original" ]]; then
+		warn 'adding "%s" for "%s"' "$pattern" "$original" >&2
+	fi
+	printf '%s' "$pattern"
+}
+
+# Print pattern $1 as gitattributes needs it: in double quotes, with C-style
+# escapes, if it contains whitespace or quotes or starts with '#'
+quote_pattern() {
+	local pattern=$1
+	if [[ $pattern == *[[:space:]\"]* ]] || [[ $pattern == '#'* ]]; then
+		pattern=${pattern//\\/\\\\}
+		pattern=${pattern//\"/\\\"}
+		pattern="\"$pattern\""
+	fi
+	printf '%s' "$pattern"
+}
+
 # Add file patterns to .gitattributes
 add_pattern() {
+	# shellcheck disable=SC2086
+	if ! is_item_in_array "$CONTEXT" ${CONFIGURED_CONTEXTS}; then
+		die 1 'transcrypt is not configured%s; configure it before adding patterns, or matching files would be committed unencrypted' "$CONTEXT_DESCRIPTION"
+	fi
+	if [[ $GIT_ATTRIBUTES == "${REPO}/.gitattributes" ]] && [[ -L $GIT_ATTRIBUTES ]]; then
+		die 1 'git ignores %s because it is a symlink, so no pattern in it would take effect; make it a regular file' "$GIT_ATTRIBUTES"
+	fi
+
+	# the directory the user ran the command from, relative to the top level.
+	# Git aliases like `git add-crypt` run from the top level and set GIT_PREFIX
+	local prefix=${GIT_PREFIX:-}
+	[[ $prefix || $IS_BARE == 'true' ]] || prefix=$(git rev-parse --show-prefix)
+	[[ $IS_BARE == 'true' ]] || cd "$REPO" >/dev/null || die 1 'could not change into the "%s" directory' "$REPO"
+
+	local backup='' var pattern line
+	if [[ -f $GIT_ATTRIBUTES ]]; then
+		backup=$(mktemp 2>/dev/null || mktemp -t tmp)
+		cp "$GIT_ATTRIBUTES" "$backup"
+	fi
+	local before=()
+	if [[ $IS_BARE == 'false' ]]; then
+		while IFS= read -r -d '' var; do before+=("$var"); done < <(_list_crypt_candidates_z)
+	fi
+
 	for var in "$@"; do
-		line="$var  filter=crypt${CONTEXT_CRYPT_SUFFIX} diff=crypt${CONTEXT_CRYPT_SUFFIX} merge=crypt${CONTEXT_CRYPT_SUFFIX}"
-		grep -qxF "$line" "${GIT_ATTRIBUTES}" || echo "$line" >>"${GIT_ATTRIBUTES}"
+		pattern=$(normalize_pattern "$var" "$prefix") || exit 1
+		line="$(quote_pattern "$pattern")  filter=crypt${CONTEXT_CRYPT_SUFFIX} diff=crypt${CONTEXT_CRYPT_SUFFIX} merge=crypt${CONTEXT_CRYPT_SUFFIX}"
+		if ! grep -qxF "$line" "${GIT_ATTRIBUTES}" 2>/dev/null; then
+			# don't glue the new rule onto a last line without a newline
+			if [[ -s $GIT_ATTRIBUTES ]] && [[ $(tail -c1 "$GIT_ATTRIBUTES" | wc -l) -eq 0 ]]; then
+				echo >>"${GIT_ATTRIBUTES}"
+			fi
+			echo "$line" >>"${GIT_ATTRIBUTES}"
+		fi
 		sync
 	done
+
+	[[ $IS_BARE == 'false' ]] || return 0
+
+	# Encrypting an attributes file would hide every rule in it from clones
+	local attr_file attr_value
+	while IFS= read -r -d '' attr_file; do
+		attr_value=$(git check-attr filter -- "$attr_file" | sed 's/.*: filter: //')
+		if [[ $attr_value == crypt* ]]; then
+			if [[ $backup ]]; then cat "$backup" >"$GIT_ATTRIBUTES"; fi
+			rm -f "$backup"
+			die 1 'the pattern would encrypt %s itself, hiding its rules from every other clone; nothing was changed' "$attr_file"
+		fi
+	done < <(git ls-files -z --cached --others --exclude-standard -- ':(glob)**/.gitattributes')
+	rm -f "$backup"
+
+	# Report what the new patterns match
+	local after=() file new=() in_git=() case_only=() ciphertext
+	while IFS= read -r -d '' file; do after+=("$file"); done < <(_list_crypt_candidates_z)
+	if [[ ${#after[@]} -gt 0 ]]; then
+		for file in "${after[@]}"; do
+			if [[ ${#before[@]} -eq 0 ]] || ! is_item_in_array "$file" "${before[@]}"; then
+				new+=("$file")
+			fi
+		done
+	fi
+	if [[ ${#new[@]} -eq 0 ]]; then
+		warn 'no files match the new pattern yet; files matching it will be encrypted when added'
+		return 0
+	fi
+
+	ciphertext=$(mktemp 2>/dev/null || mktemp -t tmp)
+	for file in "${new[@]}"; do
+		# already in git without encryption: staged, or in the last commit
+		if git cat-file -e ":$file" 2>/dev/null; then
+			git cat-file blob ":$file" >"$ciphertext"
+			is_ciphertext "$ciphertext" || in_git+=("$file")
+		fi
+	done
+	rm -f "$ciphertext"
+	if [[ ${#in_git[@]} -gt 0 ]]; then
+		warn 'these files are already in git unencrypted:'
+		printf '  %s\n' "${in_git[@]}" >&2
+		# shellcheck disable=SC2016
+		warn 'encrypt them in your next commit with `git add --renormalize -- FILE`; earlier commits keep the plaintext, so rotate those secrets'
+	fi
+
+	# patterns that match only because this file system ignores case won't
+	# match on case-sensitive systems such as Linux, so files would be
+	# committed unencrypted there
+	if [[ $(git config --get --bool core.ignorecase) == 'true' ]]; then
+		local sensitive=()
+		while IFS= read -r -d '' file; do sensitive+=("$file"); done < <(_list_crypt_candidates_z -c core.ignorecase=false)
+		for file in "${new[@]}"; do
+			if [[ ${#sensitive[@]} -eq 0 ]] || ! is_item_in_array "$file" "${sensitive[@]}"; then
+				case_only+=("$file")
+			fi
+		done
+		if [[ ${#case_only[@]} -gt 0 ]]; then
+			warn 'these files match only because this file system ignores case, so they will NOT be encrypted on case-sensitive systems like Linux; fix the case of the pattern:'
+			printf '  %s\n' "${case_only[@]}" >&2
+		fi
+	fi
 }
 
 # verify that all requirements have been met
@@ -1673,7 +1835,9 @@ help() {
 		            display the current repository's cipher and password
 
 		     --add, --add=pattern
-		            add a file pattern to encrypt to the .gitattributes file
+		            add a file pattern to encrypt to the .gitattributes file;  repeat
+		            to add several.  Paths are relative to the current directory, and
+		            a directory adds dir/** to match all the files inside it
 
 		     -r, --rekey
 		            re-encrypt all encrypted files using new credentials
@@ -1811,7 +1975,7 @@ help() {
 context=''
 cipher=''
 display_config=''
-add_pattern=''
+add_patterns=()
 list_contexts_command=''
 flush_creds=''
 gpg_import_file=''
@@ -1876,14 +2040,14 @@ while [[ "${1:-}" != '' ]]; do
 		[[ $password ]] || die 1 'empty password'
 		;;
 	--add)
-		add_pattern=${2:-1}
-		[[ $add_pattern ]] || die 1 'empty pattern'
+		[[ ${2:-} ]] || die 1 'empty pattern'
+		add_patterns+=("$2")
 		requires_clean_repo=''
 		shift
 		;;
 	--add=*)
-		add_pattern=${1#*=}
-		[[ $add_pattern ]] || die 1 'empty pattern'
+		[[ ${1#*=} ]] || die 1 'empty pattern'
+		add_patterns+=("${1#*=}")
 		requires_clean_repo=''
 		;;
 	-C | --context)
@@ -2027,8 +2191,8 @@ if [[ $list ]]; then
 elif [[ $uninstall ]]; then
 	uninstall_transcrypt
 	exit 0
-elif [[ $add_pattern ]]; then
-	add_pattern "$add_pattern"
+elif [[ ${#add_patterns[@]} -gt 0 ]]; then
+	add_pattern "${add_patterns[@]}"
 	exit 0
 elif [[ $upgrade ]]; then
 	upgrade_transcrypt
