@@ -375,3 +375,85 @@ function stored {
   [ "$status" -ne 0 ]
   [ -z "$(git ls-files secret.env)" ]
 }
+
+@test "fail-safe: diffs are not cached as plaintext" {
+  encrypt_named_file sensitive_file "My secret content"
+
+  run git log -p -- sensitive_file
+  [[ "$output" == *"+My secret content"* ]]
+  run git rev-parse --verify --quiet refs/notes/textconv/crypt
+  [ "$status" -ne 0 ]
+}
+
+@test "fail-safe: --flush-credentials keeps unrelated unreachable objects" {
+  encrypt_named_file sensitive_file "My secret content"
+  echo "work in progress" > other.txt
+  git add other.txt
+  git stash -q
+  dropped=$(git rev-parse stash@{0})
+  git stash drop -q
+
+  run "$TRANSCRYPT" --flush-credentials --yes
+  [ "$status" -eq 0 ]
+  git cat-file -e "$dropped"
+}
+
+@test "fail-safe: --upgrade removes an old plaintext diff cache" {
+  encrypt_named_file sensitive_file "My secret content"
+  git config diff.crypt.cachetextconv true
+  git log -p -- sensitive_file > /dev/null
+  git rev-parse --verify --quiet refs/notes/textconv/crypt
+
+  run "$TRANSCRYPT" --upgrade --yes
+  [ "$status" -eq 0 ]
+  run git rev-parse --verify --quiet refs/notes/textconv/crypt
+  [ "$status" -ne 0 ]
+  [ -z "$(git config --get diff.crypt.cachetextconv)" ]
+}
+
+@test "fail-safe: --flush-credentials waits for another git process to release the index" {
+  encrypt_named_file sensitive_file "My secret content"
+  touch .git/index.lock
+  (sleep 2 && rm -f .git/index.lock) &
+
+  run "$TRANSCRYPT" --flush-credentials --yes
+  wait
+  [ "$status" -eq 0 ]
+  [ "$(cat sensitive_file)" = "$(git show HEAD:sensitive_file --no-textconv)" ]
+}
+
+@test "fail-safe: --flush-credentials never leaves plaintext while the index stays locked" {
+  encrypt_named_file sensitive_file "My secret content"
+  touch .git/index.lock
+
+  run "$TRANSCRYPT" --flush-credentials --yes
+  rm -f .git/index.lock
+  # Depending on whether git needs the lock to refresh the index, the flush
+  # either refuses up front, changing nothing, or completes with the file
+  # re-encrypted without a checkout
+  if [ "$status" -eq 1 ]; then
+    [[ "$output" == *"is another git process running?"* ]]
+    [ "$(git config --get transcrypt.password)" = "abc 123" ]
+    [ "$(cat sensitive_file)" = "My secret content" ]
+  else
+    [ "$status" -eq 0 ]
+    [ -z "$(git config --get transcrypt.password)" ]
+    [ "$(cat sensitive_file)" = "$(git show HEAD:sensitive_file --no-textconv)" ]
+  fi
+}
+
+@test "fail-safe: --flush-credentials writes ciphertext when a checkout fails" {
+  encrypt_named_file sensitive_file "My secret content"
+  encrypt_named_file other_file "Other content"
+
+  # A git whose checkouts always fail, as when another process holds the lock
+  real_git=$(command -v git)
+  mkdir "$BATS_TEST_TMPDIR/bin"
+  printf '#!/usr/bin/env bash\n[[ $1 == checkout ]] && exit 128\nexec "%s" "$@"\n' "$real_git" > "$BATS_TEST_TMPDIR/bin/git"
+  chmod +x "$BATS_TEST_TMPDIR/bin/git"
+
+  PATH="$BATS_TEST_TMPDIR/bin:$PATH" run "$TRANSCRYPT" --flush-credentials --yes
+  [ "$status" -eq 0 ]
+  [ "$(cat sensitive_file)" = "$(git show HEAD:sensitive_file --no-textconv)" ]
+  [ "$(cat other_file)" = "$(git show HEAD:other_file --no-textconv)" ]
+}

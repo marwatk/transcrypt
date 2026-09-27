@@ -13,7 +13,9 @@ SECRET_CONTENT_ENC="U2FsdGVkX1/6ilR0PmJpAyCF7iG3+k4aBwbgVd48WaQXznsg42nXbQrlWsf/
   [ "$status" -eq 0 ]
   [ "${lines[0]}" = "$SECRET_CONTENT" ]
 
-  # Show all changes, caches plaintext due to `cachetextconv` setting
+  # Show all changes, caching plaintext as older versions did with the
+  # `cachetextconv` setting
+  git config diff.crypt.cachetextconv true
   run git log -p -- sensitive_file
   [ "$status" -eq 0 ]
   [[ "${output}" = *"+$SECRET_CONTENT" ]]  # Check last line of patch
@@ -61,7 +63,9 @@ SECRET_CONTENT_ENC="U2FsdGVkX1/6ilR0PmJpAyCF7iG3+k4aBwbgVd48WaQXznsg42nXbQrlWsf/
   [ "$status" -eq 0 ]
   [ "${lines[0]}" = "$SECRET_CONTENT" ]
 
-  # Show all changes, caches plaintext due to `cachetextconv` setting
+  # Show all changes, caching plaintext as older versions did with the
+  # `cachetextconv` setting
+  git config diff.crypt.cachetextconv true
   run git log -p -- sensitive_file
   [ "$status" -eq 0 ]
   [[ "${output}" = *"+$SECRET_CONTENT" ]]  # Check last line of patch

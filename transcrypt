@@ -650,8 +650,11 @@ run_safety_checks() {
 	# ensure the repository is clean (if it has a HEAD revision) so we can force
 	# checkout files without the destruction of uncommitted changes
 	if [[ $requires_clean_repo ]] && [[ $HEAD_EXISTS ]] && [[ $IS_BARE == 'false' ]]; then
-		# ensure index is up-to-date before dirty check
-		git update-index -q --really-refresh
+		# ensure index is up-to-date before dirty check, waiting briefly for
+		# another git process (e.g. an editor's background `git status`)
+		wait_for_index_lock
+		git update-index -q --really-refresh ||
+			die 1 'could not refresh the git index; is another git process running?'
 		# check if the repo is dirty
 		if ! git diff-index --quiet HEAD --; then
 			warn 'the repo is dirty; commit or stash your changes before running transcrypt\n'
@@ -926,7 +929,6 @@ save_configuration() {
 	fi
 
 	git config filter.crypt.required 'true'
-	git config diff.crypt.cachetextconv 'true'
 	git config diff.crypt.binary 'true'
 	git config merge.renormalize 'true'
 	git config merge.crypt.name 'Merge transcrypt secret files'
@@ -986,8 +988,13 @@ clean_gitconfig() {
 }
 
 # Remove from the local Git DB any objects containing the cached plaintext of
-# secret files, created due to the setting diff.crypt.cachetextconv='true'
+# secret files, created by older versions that set diff.crypt.cachetextconv='true'
 remove_cached_plaintext() {
+	# Nothing to do unless a cache exists (transcrypt no longer creates one).
+	# Pruning also permanently deletes unrelated unreachable objects, such as
+	# recently dropped stashes, so don't do it needlessly
+	git rev-parse --verify --quiet refs/notes/textconv/crypt >/dev/null || return 0
+
 	# Delete ref to cached plaintext objects, to leave these objects
 	# unreferenced and available for removal
 	git update-ref -d refs/notes/textconv/crypt
@@ -999,25 +1006,65 @@ remove_cached_plaintext() {
 	git gc --prune=now --quiet
 }
 
+# Wait up to 5 seconds for another git process to release the index lock
+wait_for_index_lock() {
+	local lock
+	lock=$(git rev-parse --git-path index.lock)
+	for _ in 1 2 3 4 5 6 7 8 9 10; do
+		[[ -e $lock ]] || return 0
+		sleep 0.5
+	done
+}
+
+# Check out file $1 from HEAD, retrying for a few seconds while another git
+# process (e.g. an editor's background `git status`) holds the index lock
+checkout_file_with_retry() {
+	local lock
+	lock=$(git rev-parse --git-path index.lock)
+	for _ in 1 2 3 4 5 6 7 8 9 10; do
+		git checkout --force HEAD -- ":(literal)$1" >/dev/null 2>&1 && return 0
+		[[ -e $lock ]] || return 1
+		sleep 0.5
+	done
+	return 1
+}
+
 # force the checkout of any files with the crypt filter applied to them;
 # this will decrypt existing encrypted files if you've just cloned a repository,
-# or it will encrypt locally decrypted files if you've just flushed the credentials
+# or it will encrypt locally decrypted files if you've just flushed the credentials.
+# Pass 'decrypt' as $1 when configuring, to report files left encrypted
 force_checkout() {
+	local direction=${1:-}
 	# make sure a HEAD revision exists
 	if [[ $HEAD_EXISTS ]] && [[ $IS_BARE == 'false' ]]; then
 		# this would normally delete uncommitted changes in the working directory,
 		# but we already made sure the repo was clean during the safety checks
 		cd "$REPO" >/dev/null || die 1 'could not change into the "%s" directory' "$REPO"
 		load_context_encrypted_files
-		local file
+		local file failed=()
 		if [[ ${#ENCRYPTED_FILES[@]} -gt 0 ]]; then
 			for file in "${ENCRYPTED_FILES[@]}"; do
 				# skip files not committed yet: there is nothing to check out, and
-				# removing them would lose their only copy
+				# removing them would lose their only copy. Skip files git keeps
+				# out of the working tree (e.g. outside a sparse checkout) too
 				git cat-file -e "HEAD:$file" 2>/dev/null || continue
+				[[ $(git ls-files -t -- ":(literal)$file") != S* ]] || continue
+				# git never filters symlinks
+				[[ $(git ls-files -s -- ":(literal)$file") != 120000* ]] || continue
 				rm -f "$file"
-				git checkout --force HEAD -- ":(literal)$file" >/dev/null
+				if ! checkout_file_with_retry "$file"; then
+					# Never leave a file missing or decrypted: write its encrypted
+					# form exactly as committed, which needs no index lock
+					git cat-file blob "HEAD:$file" >"$file"
+					failed+=("$file")
+				fi
 			done
+		fi
+		if [[ ${#failed[@]} -gt 0 ]] && [[ $direction == 'decrypt' ]]; then
+			warn 'another git process held the index, so these files were left encrypted:'
+			printf '  %s\n' "${failed[@]}" >&2
+			# shellcheck disable=SC2016
+			warn 'decrypt each one with `git checkout HEAD -- FILE` once it has finished'
 		fi
 	fi
 }
@@ -1029,8 +1076,9 @@ flush_credentials() {
 
 	if [[ $interactive ]]; then
 		printf 'You are about to flush the local credentials; make sure you have saved them elsewhere.\n'
-		printf 'All previously decrypted files will revert to their encrypted form, and your\n'
-		printf 'repo will be garbage collected to remove any cached plaintext of secret files.\n\n'
+		printf 'All previously decrypted files will revert to their encrypted form. If an older\n'
+		printf 'version cached plaintext of secret files, the repo will be garbage collected\n'
+		printf 'to remove it, which also permanently removes other unreachable objects.\n\n'
 		printf 'Proceed with credential flush? [y/N] '
 		read -r answer
 		printf '\n'
@@ -1069,8 +1117,9 @@ uninstall_transcrypt() {
 
 	if [[ $interactive ]]; then
 		printf 'You are about to remove all transcrypt configuration from your repository.\n'
-		printf 'All previously encrypted files will remain decrypted in this working copy, but your\n'
-		printf 'repo will be garbage collected to remove any cached plaintext of secret files.\n\n'
+		printf 'All previously encrypted files will remain decrypted in this working copy. If an\n'
+		printf 'older version cached plaintext of secret files, the repo will be garbage\n'
+		printf 'collected to remove it, which also permanently removes other unreachable objects.\n\n'
 		if [[ $(count_items_in_list "$CONFIGURED_CONTEXTS") -gt "1" ]]; then
 			printf 'Proceed with uninstall of all contexts (%s)? [y/N] ' "$CONFIGURED_CONTEXTS"
 		else
@@ -1234,6 +1283,15 @@ upgrade_transcrypt() {
 	done
 
 	uninstall_transcrypt
+
+	# Older versions cached decrypted diffs in this ref, which operations such
+	# as `git push --mirror` would send off the machine. Delete it; its
+	# objects go with git's normal garbage collection
+	if git rev-parse --verify --quiet refs/notes/textconv/crypt >/dev/null; then
+		git update-ref -d refs/notes/textconv/crypt
+		printf 'Removed the cache of decrypted diffs (refs/notes/textconv/crypt).\n'
+		printf 'Its objects are pruned by git gc, or now with: git gc --prune=now\n\n'
+	fi
 
 	# Reconfigure cipher and password for each context
 	local i
@@ -2028,7 +2086,7 @@ save_configuration
 if [[ $rekey ]]; then
 	stage_rekeyed_files
 else
-	force_checkout
+	force_checkout decrypt
 	# check for newly modified (dirty) files after transcrypt configuration which could
 	# indicate an incorrect password
 	if [[ ${GIT_DIRTY_FILES_BEFORE_INIT} -lt $(count_dirty_files) ]]; then

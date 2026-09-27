@@ -42,6 +42,10 @@ system, you must also run the `--upgrade` command in each repository:
   `transcrypt --upgrade` in existing repositories to apply it.
 - Refuse to initialise with a password that doesn't decrypt the files already
   committed, instead of saving it and relying on the dirty-files check
+- Stop caching decrypted diffs (`diff.crypt.cachetextconv`): the cache kept
+  plaintext of every viewed secret version under `refs/notes/textconv/crypt`,
+  which `git push --mirror`, `git bundle --all` and similar send off the
+  machine. `--upgrade` deletes an existing cache ref
 
 ### Added
 
@@ -77,6 +81,14 @@ system, you must also run the `--upgrade` command in each repository:
   and `--upgrade` no longer abort halfway when the crypt directory holds other
   files (e.g. from `--export-gpg`) or `merge.renormalize` is already unset
 - `--verify` and the init password check work when run from a subdirectory
+- `--flush-credentials` and `--uninstall` only garbage collect when a plaintext
+  cache from an older version exists, instead of always running
+  `git gc --prune=now`, which permanently deleted unrelated unreachable
+  objects such as dropped stashes
+- `--flush-credentials` no longer leaves secrets decrypted when another git
+  process (e.g. an editor) holds the index lock: it waits briefly, refuses to
+  start if the lock stays held, and writes a file's committed ciphertext if
+  its checkout still fails
 - Fail instead of storing files unencrypted or under an empty password: clean
   refuses when no cipher or password is configured, or when the openssl
   version can't be determined (e.g. an `openssl-path` containing spaces, which

@@ -65,7 +65,7 @@ function setup {
   [ "$(git config --get merge.crypt.driver)" = '"$(git config transcrypt.crypt-dir 2>/dev/null || printf ''%s/crypt'' ""$(git rev-parse --git-common-dir)"")"/transcrypt merge context=default %O %A %B %L %P' ]
 
   [[ $(git config --get filter.crypt.required) = "true" ]]
-  [[ $(git config --get diff.crypt.cachetextconv) = "true" ]]
+  [[ -z $(git config --get diff.crypt.cachetextconv) ]]
   [[ $(git config --get diff.crypt.binary) = "true" ]]
   [[ $(git config --get merge.renormalize) = "true" ]]
 
