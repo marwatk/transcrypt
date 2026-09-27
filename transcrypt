@@ -262,11 +262,16 @@ load_context_encrypted_files() {
 # require this work-around for major version 3.
 #
 # See #133 #147
+# Fails if the version can't be determined: guessing wrong would write
+# ciphertext without the 'Salted__' header, which no clone could decrypt.
 is_salt_prefix_workaround_required() {
 	openssl_path=$(git config --get --local transcrypt.openssl-path 2>/dev/null || printf '%s' "$openssl_path")
 
-	openssl_project=$($openssl_path version | cut -d' ' -f1)
-	openssl_major_version=$($openssl_path version | cut -d' ' -f2 | cut -d'.' -f1)
+	local openssl_version
+	openssl_version=$("$openssl_path" version 2>/dev/null) || return 1
+	[[ $openssl_version ]] || return 1
+	openssl_project=$(echo "$openssl_version" | cut -d' ' -f1)
+	openssl_major_version=$(echo "$openssl_version" | cut -d' ' -f2 | cut -d'.' -f1)
 
 	if [ "$openssl_project" == "OpenSSL" ] && [ "$openssl_major_version" -ge "3" ]; then
 		echo 'true'
@@ -360,16 +365,28 @@ git_clean() {
 	# the first bytes of an encrypted file are always "Salted" in Base64
 	# The `head + LC_ALL=C tr` command handles binary data in old and new Bash (#116)
 	firstbytes=$(head -c8 "$tempfile" | LC_ALL=C tr -d '\0')
-	if [[ $firstbytes == "U2FsdGVk" ]]; then
+	# missing settings are reported below rather than failing silently here
+	context_config_group=$(derive_context_config_group "$context")
+	cipher=$(git config --get --local "transcrypt${context_config_group}.cipher") || true
+	password=$(load_password "$context_config_group")
+	openssl_path=$(git config --get --local transcrypt.openssl-path) || true
+	# Content that is already encrypted, e.g. a file the smudge filter left
+	# encrypted, is stored as it is. Encrypted content is base64 throughout, so
+	# content that merely starts like it but contains anything else is
+	# plaintext and gets encrypted
+	if [[ $firstbytes == "U2FsdGVk" ]] && ! LC_ALL=C grep -aq $'[^A-Za-z0-9+/=\r]' "$tempfile"; then
 		cat "$tempfile"
 	else
-		context_config_group=$(derive_context_config_group "$context")
-		cipher=$(git config --get --local "transcrypt${context_config_group}.cipher")
-		password=$(load_password "$context_config_group")
-		openssl_path=$(git config --get --local transcrypt.openssl-path)
+		# refuse rather than store the file unencrypted or with an empty password
+		if [[ ! $cipher ]] || [[ ! $password ]]; then
+			die 1 'no cipher and password configured for context %s; refusing to store %s' "${context:-default}" "$filename"
+		fi
 		salt=$(derive_salt "$openssl_path" "$filename" "$password" "$tempfile")
+		local salt_prefix_workaround
+		salt_prefix_workaround=$(is_salt_prefix_workaround_required) ||
+			die 1 'cannot determine the version of openssl at "%s"; refusing to store %s' "$openssl_path" "$filename"
 
-		if [ "$(is_salt_prefix_workaround_required)" == "true" ]; then
+		if [ "$salt_prefix_workaround" == "true" ]; then
 			# Encrypt the file to base64, ensuring it includes the prefix 'Salted__' with the salt. #133
 			(
 				echo -n "Salted__" && echo -n "$salt" | hex_to_bin &&
@@ -623,7 +640,10 @@ run_safety_checks() {
 	done
 
 	# check for a working method to convert a hex string to binary data
-	if [ "$(is_salt_prefix_workaround_required)" == "true" ]; then
+	local salt_prefix_workaround
+	salt_prefix_workaround=$(is_salt_prefix_workaround_required) ||
+		die 1 'cannot determine the version of openssl at "%s"' "$openssl_path"
+	if [ "$salt_prefix_workaround" == "true" ]; then
 		echo -n "41" | hex_to_bin >/dev/null
 	fi
 
@@ -658,6 +678,19 @@ validate_cipher() {
 
 	local supported
 	supported=$($list_cipher_commands | tr -s ' ' '\n' | grep -Fx "$cipher") || true
+	# Only allow real ciphers with a 128-bit block in a non-ECB mode. openssl
+	# also lists encodings (base64 on LibreSSL), ECB modes, which reveal
+	# repeated blocks, and weak or 64-bit-block ciphers (des, rc2, rc4, bf)
+	if [[ $supported ]] && [[ ! $cipher =~ ^(aes|aria|camellia)-(128|192|256)-(cbc|cfb|cfb1|cfb8|ctr|ofb)$ ]] &&
+		[[ ! $cipher =~ ^(aes|aria|camellia)(128|192|256)$ ]]; then
+		if [[ $interactive ]]; then
+			printf '"%s" is not allowed; choose AES, ARIA or Camellia in CBC, CTR, CFB or OFB mode\n\n' "$cipher"
+			cipher=''
+			return
+		else
+			die 1 '"%s" is not allowed; choose AES, ARIA or Camellia in CBC, CTR, CFB or OFB mode' "$cipher"
+		fi
+	fi
 	if [[ ! $supported ]]; then
 		if [[ $interactive ]]; then
 			printf '"%s" is not a valid cipher; choose one of the following:\n\n' "$cipher"
@@ -888,6 +921,8 @@ save_configuration() {
 		git config filter.crypt"${CONTEXT_CRYPT_SUFFIX}".smudge "$transcrypt_path smudge context=$CONTEXT %f"
 		git config diff.crypt"${CONTEXT_CRYPT_SUFFIX}".textconv "$transcrypt_path textconv context=$CONTEXT"
 		git config merge.crypt"${CONTEXT_CRYPT_SUFFIX}".driver "$transcrypt_path merge context=$CONTEXT %O %A %B %L %P"
+		# fail if the filter fails, rather than storing the file unencrypted
+		git config filter.crypt"${CONTEXT_CRYPT_SUFFIX}".required 'true'
 	fi
 
 	git config filter.crypt.required 'true'
@@ -1413,6 +1448,12 @@ import_gpg() {
 
 	cipher=$(printf '%s' "$configuration" | grep '^cipher' | cut -d'=' -f 2-)
 	password=$(printf '%s' "$configuration" | grep '^password' | cut -d'=' -f 2-)
+	[[ $cipher ]] || die 1 'no cipher found in "%s"' "$path"
+	[[ $password ]] || die 1 'no password found in "%s"' "$path"
+
+	# an imported file must meet the same standard as -c
+	local interactive=''
+	validate_cipher
 }
 
 # Echo space-delimited list of context names defined in the git config

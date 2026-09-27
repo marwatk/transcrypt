@@ -77,6 +77,19 @@ system, you must also run the `--upgrade` command in each repository:
   and `--upgrade` no longer abort halfway when the crypt directory holds other
   files (e.g. from `--export-gpg`) or `merge.renormalize` is already unset
 - `--verify` and the init password check work when run from a subdirectory
+- Fail instead of storing files unencrypted or under an empty password: clean
+  refuses when no cipher or password is configured, or when the openssl
+  version can't be determined (e.g. an `openssl-path` containing spaces, which
+  produced ciphertext without the `Salted__` header that no clone could
+  decrypt), and filters for named contexts are now `required` like the
+  default context's
+- Content that starts like ciphertext (`U2FsdGVk`) is only stored as it is if
+  it is entirely base64; other content is encrypted
+- Refuse ciphers that don't encrypt properly: only AES, ARIA and Camellia in
+  CBC, CTR, CFB or OFB mode are accepted, for `--cipher`, interactive choice
+  and `--import-gpg`. LibreSSL, the default `openssl` on macOS, previously
+  allowed `base64`, which stored files unencrypted, and all platforms allowed
+  ECB modes
 
 - Fix error in pre-commit hook's "fast" multi-threaded mode when `nproc` is not
   installed but `bash` 4.4+ is: fall back to 1 thread (#197)

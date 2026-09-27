@@ -293,3 +293,85 @@ function stored {
   [ "$status" -eq 0 ]
   [ -f new.env ]
 }
+
+@test "fail-safe: clean refuses to encrypt without a password" {
+  echo '"secret.env" filter=crypt diff=crypt merge=crypt' >> .gitattributes
+  git add .gitattributes
+  git config --unset transcrypt.password
+  echo "SECRET=1" > secret.env
+
+  run git add secret.env
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"no cipher and password configured for context default; refusing to store secret.env"* ]]
+  [ -z "$(git ls-files secret.env)" ]
+}
+
+@test "fail-safe: context filters are required, so a failure never stores plaintext" {
+  "$TRANSCRYPT" --context=super --cipher=aes-256-cbc --password=super-pw --yes > /dev/null
+  [ "$(git config --get filter.crypt-super.required)" = "true" ]
+
+  echo '"top-secret" filter=crypt-super diff=crypt-super merge=crypt-super' >> .gitattributes
+  git add .gitattributes
+  git config --unset transcrypt.super.password
+  echo "TOP SECRET" > top-secret
+
+  run git add top-secret
+  [ "$status" -ne 0 ]
+  [ -z "$(git ls-files top-secret)" ]
+}
+
+@test "fail-safe: clean encrypts plaintext that merely starts like ciphertext" {
+  echo '"secret.env" filter=crypt diff=crypt merge=crypt' >> .gitattributes
+  printf 'U2FsdGVkX1 is how it starts\nSECRET=1\n' > secret.env
+  git add .gitattributes secret.env
+  git commit -q -m "Add secret"
+
+  [ "$(git show HEAD:secret.env --no-textconv)" != "$(cat secret.env)" ]
+  rm secret.env
+  git checkout -- secret.env
+  [ "$(cat secret.env)" = "$(printf 'U2FsdGVkX1 is how it starts\nSECRET=1')" ]
+}
+
+@test "fail-safe: clean passes through ciphertext that decrypts with the password" {
+  encrypt_named_file sensitive_file "My secret content"
+  git show HEAD:sensitive_file --no-textconv > sensitive_file
+
+  run git add sensitive_file
+  [ "$status" -eq 0 ]
+  [ "$(git rev-parse :sensitive_file)" = "$(git rev-parse HEAD:sensitive_file)" ]
+}
+
+@test "fail-safe: ECB and non-ciphers are refused" {
+  "$TRANSCRYPT" --flush-credentials --yes > /dev/null
+
+  run "$TRANSCRYPT" --cipher=aes-256-ecb --password=pw --yes
+  [ "$status" -eq 1 ]
+  [[ "$output" == *'"aes-256-ecb" is not allowed'* ]]
+
+  run "$TRANSCRYPT" --cipher=base64 --password=pw --yes
+  [ "$status" -eq 1 ]
+  [ -z "$(git config --get transcrypt.cipher)" ]
+}
+
+@test "fail-safe: an openssl path containing spaces still produces decryptable ciphertext" {
+  mkdir "$BATS_TEST_TMPDIR/open ssl"
+  ln -s "$(command -v openssl)" "$BATS_TEST_TMPDIR/open ssl/openssl"
+  git config transcrypt.openssl-path "$BATS_TEST_TMPDIR/open ssl/openssl"
+  encrypt_named_file sensitive_file "My secret content"
+
+  [[ "$(git show HEAD:sensitive_file --no-textconv)" == U2FsdGVk* ]]
+  rm sensitive_file
+  git checkout -- sensitive_file
+  [ "$(cat sensitive_file)" = "My secret content" ]
+}
+
+@test "fail-safe: clean refuses to store a file when openssl can't run" {
+  echo '"secret.env" filter=crypt diff=crypt merge=crypt' >> .gitattributes
+  git add .gitattributes
+  git config transcrypt.openssl-path /nonexistent/openssl
+  echo "SECRET=1" > secret.env
+
+  run git add secret.env
+  [ "$status" -ne 0 ]
+  [ -z "$(git ls-files secret.env)" ]
+}
